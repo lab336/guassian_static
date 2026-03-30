@@ -6,3 +6,5 @@ SFS/surface_only.ply
 SFS/projections/*
 output/*
 images/*
+data/*
+video/*
