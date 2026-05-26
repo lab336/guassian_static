@@ -1,4 +1,4 @@
-"""
+r"""
 多相机三维点云重建 Pipeline
 从多相机去畸变图像 + 已知相机内外参，使用 RoMa v2 生成三维点云。
 
@@ -402,7 +402,10 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
     Phase 3: 多视角可见性验证
     Phase 4: 多视角颜色混合
     """
+    # 兼容两种布局：frame_dir/images/ 或 frame_dir/ 直接存图
     img_dir = frame_dir / "images"
+    if not img_dir.exists():
+        img_dir = frame_dir
 
     available = sorted(
         [f.name for f in img_dir.iterdir()
@@ -561,7 +564,7 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
 def main():
     parser = argparse.ArgumentParser(
         description="多相机三维点云重建 (RoMa v2)")
-    parser.add_argument("--data_dir", default="images_processed",
+    parser.add_argument("--data_dir", default="F:/by_frame",
                         help="数据根目录")
     parser.add_argument("--output_dir", default="output",
                         help="输出目录")
@@ -594,6 +597,8 @@ def main():
                         help="SOR 近邻数")
     parser.add_argument("--sor_std", type=float, default=3.0,
                         help="SOR 标准差倍数")
+    parser.add_argument("--sparse_dir", default=None,
+                        help="COLMAP sparse/0 目录 (默认: data_dir/sparse/0)")
     parser.add_argument("--compile", action="store_true",
                         help="启用 torch.compile (需要 Triton)")
     args = parser.parse_args()
@@ -622,7 +627,7 @@ def main():
     out_path.mkdir(parents=True, exist_ok=True)
 
     # ---- 1. 解析 COLMAP 相机参数 ----
-    sparse_dir = data_path / "sparse" / "0"
+    sparse_dir = Path(args.sparse_dir) if args.sparse_dir else data_path / "sparse" / "0"
     print(f"[1/4] 解析相机参数: {sparse_dir}")
     cameras = parse_cameras(sparse_dir / "cameras.txt")
     images_info = parse_images(sparse_dir / "images.txt")
@@ -660,8 +665,12 @@ def main():
     for out_idx, fid in enumerate(tqdm(frame_ids, desc="总进度"), start=1):
         fdir = data_path if fid == "." else (data_path / fid)
         frame_tag = "root" if fid == "." else fid
-        if not (fdir / "images").exists():
-            tqdm.write(f"  [帧 {frame_tag}] 目录不存在，跳过")
+        has_images_subdir = (fdir / "images").exists()
+        has_direct_images = fdir.exists() and (
+            any(fdir.glob("*.jpg")) or any(fdir.glob("*.png")) or any(fdir.glob("*.jpeg"))
+        )
+        if not (has_images_subdir or has_direct_images):
+            tqdm.write(f"  [帧 {frame_tag}] 目录不存在或无图像，跳过")
             continue
 
         points, colors = process_frame(frame_tag, fdir, cameras, images_info, model, cfg)

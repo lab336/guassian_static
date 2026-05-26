@@ -36,6 +36,7 @@ python colmap_pipeline.py --dataset ./dataset --output ./output --calib_frame 0 
 
 import argparse
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -73,7 +74,19 @@ def run_colmap(colmap: str, args: list, description: str = "") -> bool:
     logger.info(f"执行: {cmd_str}")
     if description:
         logger.info(f"  -> {description}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Windows: 显式将 COLMAP 目录及 conda 环境 DLL 目录前置到 PATH，
+    # 避免子进程启动时出现 DLL 找不到（0xC0000135）的问题。
+    env = os.environ.copy()
+    if sys.platform == "win32":
+        colmap_dir = str(Path(colmap).parent)
+        prepend = [colmap_dir]
+        conda_prefix = env.get("CONDA_PREFIX", "")
+        if conda_prefix:
+            for sub in ("Library\\bin", "Library\\mingw-w64\\bin",
+                        "Library\\usr\\bin", "Scripts"):
+                prepend.append(os.path.join(conda_prefix, sub))
+        env["PATH"] = os.pathsep.join(prepend) + os.pathsep + env.get("PATH", "")
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if result.stdout:
         for line in result.stdout.strip().split("\n")[-20:]:
             logger.debug(f"  [stdout] {line}")
@@ -164,7 +177,6 @@ def phase1_calibration(
         [
             "exhaustive_matcher",
             "--database_path", str(db_path),
-            "--SiftMatching.use_gpu", gpu_flag,
         ],
         "穷举匹配",
     ):
@@ -226,25 +238,17 @@ def build_images_txt_for_frame(
     shutil.copy2(ref_images_txt, out_images_txt)
 
 
-def phase2_mvs_single_frame(
+def phase2a_undistort_frame(
     colmap: str,
     frame_dir: Path,
     frame_idx: int,
     ref_sparse_dir: Path,
     output_dir: Path,
     local_workspace_dir: Path,
-    use_gpu: bool,
-    geom_consistency: bool,
-    fusion_min_num_pixels: int,
-    fusion_check_num_images: int,
 ) -> bool:
     """
-    第二阶段：对单帧执行 MVS（undistort + patch_match + fusion）。
-    COLMAP 工作文件写入 local_workspace_dir（本地磁盘），最终结果复制到 output_dir。
+    第二阶段 A：对单帧执行去畸变，保留 dense workspace 供后续 MVS 使用。
     """
-    gpu_flag = "1" if use_gpu else "0"
-
-    # 工作目录：临时 dense workspace（必须在本地磁盘，COLMAP 不支持 UNC 网络路径）
     work_dir = local_workspace_dir / "_mvs_workspace" / str(frame_idx)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -252,11 +256,9 @@ def phase2_mvs_single_frame(
     frame_sparse = work_dir / "sparse_input" / "0"
     frame_sparse.mkdir(parents=True, exist_ok=True)
     for fname in ["cameras.txt", "images.txt", "points3D.txt"]:
-        src = ref_sparse_dir / fname
-        dst = frame_sparse / fname
-        shutil.copy2(src, dst)
+        shutil.copy2(ref_sparse_dir / fname, frame_sparse / fname)
 
-    # 先将 TXT 转为 BIN（image_undistorter 需要 BIN 格式）
+    # TXT -> BIN（image_undistorter 需要 BIN 格式）
     frame_sparse_bin = work_dir / "sparse_bin" / "0"
     frame_sparse_bin.mkdir(parents=True, exist_ok=True)
     if not run_colmap(
@@ -271,7 +273,7 @@ def phase2_mvs_single_frame(
     ):
         return False
 
-    # 1. image_undistorter
+    # image_undistorter
     dense_dir = work_dir / "dense"
     if not run_colmap(
         colmap,
@@ -286,13 +288,11 @@ def phase2_mvs_single_frame(
     ):
         return False
 
-    # 复制去畸变后的图像到 undistorter_images/<frame_idx>/
+    # 复制去畸变后的图像到 undistorter_images/<frame_idx>/（重命名为 1.png, 2.png, ...）
     undist_src = dense_dir / "images"
     undist_dst = output_dir / "undistorter_images" / str(frame_idx)
     undist_dst.mkdir(parents=True, exist_ok=True)
-
     if undist_src.exists():
-        # 按文件名排序，重命名为 1.png, 2.png, ...
         src_images = sorted(undist_src.iterdir(), key=lambda p: p.stem)
         for i, img in enumerate(src_images, start=1):
             shutil.copy2(img, undist_dst / f"{i}{img.suffix}")
@@ -301,8 +301,38 @@ def phase2_mvs_single_frame(
         )
     else:
         logger.warning(f"帧 {frame_idx}: 去畸变图像目录 {undist_src} 不存在")
+    return True
 
-    # 2. patch_match_stereo
+
+def phase2b_mvs_frame(
+    colmap: str,
+    frame_idx: int,
+    output_dir: Path,
+    local_workspace_dir: Path,
+    use_gpu: bool,
+    geom_consistency: bool,
+    fusion_min_num_pixels: int,
+    fusion_check_num_images: int,
+    patch_max_image_size: int,
+    patch_num_iterations: int,
+    patch_num_samples: int,
+    patch_window_radius: int,
+) -> bool:
+    """
+    第二阶段 B：对已去畸变的单帧执行 patch_match_stereo + stereo_fusion。
+    """
+    work_dir = local_workspace_dir / "_mvs_workspace" / str(frame_idx)
+    dense_dir = work_dir / "dense"
+    if not dense_dir.exists():
+        logger.error(
+            f"帧 {frame_idx}: dense workspace 不存在 {dense_dir}，请先运行去畸变。"
+        )
+        return False
+
+    # patch_match_stereo
+    # 部分 COLMAP 版本不会自动创建输出子目录，手动预建以防崩溃
+    (dense_dir / "stereo" / "depth_maps").mkdir(parents=True, exist_ok=True)
+    (dense_dir / "stereo" / "normal_maps").mkdir(parents=True, exist_ok=True)
     if not run_colmap(
         colmap,
         [
@@ -312,14 +342,17 @@ def phase2_mvs_single_frame(
             "--PatchMatchStereo.geom_consistency",
             "true" if geom_consistency else "false",
             "--PatchMatchStereo.gpu_index", "0" if use_gpu else "-1",
+            "--PatchMatchStereo.max_image_size", str(patch_max_image_size),
+            "--PatchMatchStereo.num_iterations", str(patch_num_iterations),
+            "--PatchMatchStereo.num_samples", str(patch_num_samples),
+            "--PatchMatchStereo.window_radius", str(patch_window_radius),
         ],
         f"帧 {frame_idx}: PatchMatch 立体匹配",
     ):
         return False
 
-    # 3. stereo_fusion（先写到本地，再复制到网络输出目录）
+    # stereo_fusion（先写到本地，再复制到输出目录）
     local_ply_path = work_dir / f"{frame_idx}.ply"
-
     if not run_colmap(
         colmap,
         [
@@ -340,6 +373,12 @@ def phase2_mvs_single_frame(
     ply_dst_dir.mkdir(parents=True, exist_ok=True)
     ply_dst = ply_dst_dir / f"{frame_idx}.ply"
     shutil.copy2(local_ply_path, ply_dst)
+
+    # 去畸变完成后可立即释放该帧的 dense workspace（仅删 stereo 深度图，保留 images）
+    stereo_dir = dense_dir / "stereo"
+    if stereo_dir.exists():
+        shutil.rmtree(stereo_dir, ignore_errors=True)
+
     logger.info(f"帧 {frame_idx}: 点云已保存到 {ply_dst}")
     return True
 
@@ -380,8 +419,12 @@ def main():
         help="跳过标定阶段（假设 output/sparse/0/ 已存在）",
     )
     parser.add_argument(
+        "--skip_undistort", action="store_true",
+        help="跳过去畸变阶段（假设 dense workspace 已存在于 local_workspace 中），直接运行 MVS",
+    )
+    parser.add_argument(
         "--skip_mvs", action="store_true",
-        help="只运行标定，不执行 MVS",
+        help="只运行标定和去畸变，不执行 MVS",
     )
     parser.add_argument(
         "--frame_range", type=str, default=None,
@@ -400,16 +443,32 @@ def main():
         help="禁用 GPU",
     )
     parser.add_argument(
-        "--geom_consistency", action="store_true", default=True,
-        help="PatchMatch 使用几何一致性 (默认开启)",
+        "--geom_consistency", action="store_true", default=False,
+        help="PatchMatch 使用几何一致性（提升质量但耗时翻倍，默认关闭）",
     )
     parser.add_argument(
         "--no_geom_consistency", action="store_true",
-        help="PatchMatch 不使用几何一致性",
+        help="PatchMatch 不使用几何一致性（已是默认行为，保留兼容）",
     )
     parser.add_argument(
-        "--fusion_min_num_pixels", type=int, default=3,
-        help="融合最小像素数 (默认 3)",
+        "--patch_max_image_size", type=int, default=1000,
+        help="PatchMatch 处理的最大图像尺寸，降低可大幅提速 (默认 1000)",
+    )
+    parser.add_argument(
+        "--patch_num_iterations", type=int, default=3,
+        help="PatchMatch 迭代次数，越少越快 (默认 3，COLMAP 原始默认 5)",
+    )
+    parser.add_argument(
+        "--patch_num_samples", type=int, default=5,
+        help="PatchMatch 采样数，越少越快 (默认 5，COLMAP 原始默认 8)",
+    )
+    parser.add_argument(
+        "--patch_window_radius", type=int, default=4,
+        help="PatchMatch 半窗口大小，越小越快 (默认 4，COLMAP 原始默认 5)",
+    )
+    parser.add_argument(
+        "--fusion_min_num_pixels", type=int, default=8,
+        help="融合最少视图数，越大点云越稀疏 (默认 8，调大可减少点数)",
     )
     parser.add_argument(
         "--fusion_check_num_images", type=int, default=2,
@@ -523,10 +582,10 @@ def main():
             sys.exit(1)
 
     if args.skip_mvs:
-        logger.info("仅标定模式，跳过 MVS 阶段。")
+        logger.info("仅标定/去畸变模式，跳过 MVS 阶段。")
         return
 
-    # ====================== 第二阶段：MVS ======================
+    # ====================== 第二阶段：去畸变所有帧 ======================
     logger.info("=" * 60)
     logger.info("第二阶段：固定相机参数处理所有帧 (MVS)")
     logger.info("=" * 60)
@@ -540,44 +599,105 @@ def main():
     else:
         frame_indices = list(range(n_frames))
 
+    valid_indices = [idx for idx in frame_indices if 0 <= idx < n_frames]
+
+    # ---------- Phase 2A: 所有帧去畸变 ----------
+    undistort_ok = []  # 成功去畸变的帧编号（1-based）
+    if args.skip_undistort:
+        # 收集 dense workspace 已存在的帧
+        for idx in valid_indices:
+            frame_number = idx + 1
+            dense_dir = (
+                local_workspace_dir / "_mvs_workspace" / str(frame_number) / "dense"
+            )
+            if dense_dir.exists():
+                undistort_ok.append(frame_number)
+            else:
+                logger.warning(
+                    f"帧 {frame_number}: dense workspace 不存在，跳过 MVS。"
+                )
+        logger.info(
+            f"跳过去畸变，共 {len(undistort_ok)}/{len(valid_indices)} 帧有 dense workspace。"
+        )
+    else:
+        logger.info("=" * 60)
+        logger.info("第二阶段 A：所有帧去畸变")
+        logger.info("=" * 60)
+        undistort_fail = []
+        for idx in tqdm(valid_indices, desc="去畸变", unit="帧"):
+            frame_dir = frames[idx]
+            frame_number = idx + 1
+            logger.info(f"\n{'─' * 40}")
+            logger.info(f"去畸变帧 {frame_number}/{n_frames}: {frame_dir.name}")
+            logger.info(f"{'─' * 40}")
+            try:
+                ok = phase2a_undistort_frame(
+                    colmap=colmap,
+                    frame_dir=frame_dir,
+                    frame_idx=frame_number,
+                    ref_sparse_dir=ref_sparse_dir,
+                    output_dir=output_dir,
+                    local_workspace_dir=local_workspace_dir,
+                )
+                if ok:
+                    undistort_ok.append(frame_number)
+                else:
+                    undistort_fail.append(frame_number)
+                    logger.error(f"帧 {frame_number} 去畸变失败，跳过 MVS。")
+            except Exception as e:
+                undistort_fail.append(frame_number)
+                logger.error(f"帧 {frame_number} 去畸变异常: {e}")
+        logger.info(
+            f"\n去畸变完成: 成功 {len(undistort_ok)} 帧, "
+            f"失败 {len(undistort_fail)} 帧"
+        )
+        if undistort_fail:
+            logger.info(f"  去畸变失败帧: {undistort_fail}")
+
+    if args.skip_mvs:
+        logger.info("skip_mvs 已设置，跳过 MVS 阶段。")
+        if not args.keep_workspace:
+            cleanup_mvs_workspace(local_workspace_dir)
+        return
+
+    # ---------- Phase 2B: 所有帧 MVS ----------
+    logger.info("=" * 60)
+    logger.info("第二阶段 B：所有帧 MVS (patch_match + fusion)")
+    logger.info("=" * 60)
+
     success_count = 0
     fail_count = 0
     failed_frames = []
 
-    for idx in tqdm(frame_indices, desc="MVS 处理帧", unit="帧"):
-        if idx < 0 or idx >= n_frames:
-            logger.warning(f"帧索引 {idx} 超出范围，跳过。")
-            continue
-
-        frame_dir = frames[idx]
-        frame_number = idx + 1  # 1-based 用于输出命名
+    for frame_number in tqdm(undistort_ok, desc="MVS", unit="帧"):
         logger.info(f"\n{'─' * 40}")
-        logger.info(f"处理帧 {frame_number}/{n_frames}: {frame_dir.name}")
+        logger.info(f"MVS 帧 {frame_number}/{n_frames}")
         logger.info(f"{'─' * 40}")
-
         try:
-            ok = phase2_mvs_single_frame(
+            ok = phase2b_mvs_frame(
                 colmap=colmap,
-                frame_dir=frame_dir,
                 frame_idx=frame_number,
-                ref_sparse_dir=ref_sparse_dir,
                 output_dir=output_dir,
                 local_workspace_dir=local_workspace_dir,
                 use_gpu=use_gpu,
                 geom_consistency=args.geom_consistency,
                 fusion_min_num_pixels=args.fusion_min_num_pixels,
                 fusion_check_num_images=args.fusion_check_num_images,
+                patch_max_image_size=args.patch_max_image_size,
+                patch_num_iterations=args.patch_num_iterations,
+                patch_num_samples=args.patch_num_samples,
+                patch_window_radius=args.patch_window_radius,
             )
             if ok:
                 success_count += 1
             else:
                 fail_count += 1
                 failed_frames.append(frame_number)
-                logger.error(f"帧 {frame_number} 处理失败，继续下一帧。")
+                logger.error(f"帧 {frame_number} MVS 失败，继续下一帧。")
         except Exception as e:
             fail_count += 1
             failed_frames.append(frame_number)
-            logger.error(f"帧 {frame_number} 异常: {e}，继续下一帧。")
+            logger.error(f"帧 {frame_number} MVS 异常: {e}，继续下一帧。")
 
     # 清理
     if not args.keep_workspace:
