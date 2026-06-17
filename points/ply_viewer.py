@@ -4,8 +4,8 @@
 PLY Point Cloud Crop Viewer
 
 Usage:
-    python ply_viewer.py  path/to/file.ply
-    python ply_viewer.py  path/to/file.ply  --max_display 80000
+    python points/ply_viewer.py  path/to/file.ply
+    python points/ply_viewer.py  path/to/file.ply  --max_display 80000
 
 Interaction:
     Left-drag 3D view  : rotate
@@ -42,9 +42,11 @@ def load_ply(filepath: str):
         import open3d as o3d
         pcd = o3d.io.read_point_cloud(filepath)
         pts = np.asarray(pcd.points, dtype=np.float32)
-        clr = np.asarray(pcd.colors, dtype=np.float32) if pcd.has_colors() else None
-        print(f"[open3d] {len(pts):,} points")
-        return pts, clr
+        if len(pts) > 0:
+            clr = np.asarray(pcd.colors, dtype=np.float32) if pcd.has_colors() else None
+            print(f"[open3d] {len(pts):,} points")
+            return pts, clr
+        print("[open3d] returned 0 points, falling back to built-in parser ...")
     except Exception:
         pass
 
@@ -100,6 +102,10 @@ def run(filepath: str, max_display: int = 80_000):
 
     pts, clr = load_ply(filepath)
     N = len(pts)
+
+    if N == 0:
+        raise RuntimeError(f"No points loaded from '{filepath}'. "
+                           "Check that the file exists and is a valid PLY.")
 
     # Full (original) bounds — axis limits are locked to these forever
     XLO, XHI = float(pts[:,0].min()), float(pts[:,0].max())

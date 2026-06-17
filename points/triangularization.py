@@ -560,7 +560,7 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
 def main():
     parser = argparse.ArgumentParser(
         description="多相机三维点云重建 (RoMa v2)")
-    parser.add_argument("--data_dir", default="images_processed",
+    parser.add_argument("--data_dir", default=".\\data\\test\\undistorted\\",
                         help="数据根目录")
     parser.add_argument("--output_dir", default="output",
                         help="输出目录")

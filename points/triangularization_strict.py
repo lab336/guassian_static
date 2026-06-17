@@ -261,21 +261,23 @@ def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
 
 # ======================== 点云去噪 ========================
 
-def statistical_outlier_removal(points, colors, k=20, std_mul=2.0):
+def statistical_outlier_removal(points, colors, normals=None, k=20, std_mul=2.0):
     """统计离群值去除：剔除到 k 近邻平均距离异常大的点。"""
     if len(points) < k + 1:
-        return points, colors
+        return (points, colors, normals) if normals is not None else (points, colors)
     tree = cKDTree(points)
     dists, _ = tree.query(points, k=k + 1)
     mean_d = dists[:, 1:].mean(axis=1)
     thr = mean_d.mean() + std_mul * mean_d.std()
     mask = mean_d < thr
+    if normals is not None:
+        return points[mask], colors[mask], normals[mask]
     return points[mask], colors[mask]
 
 
 # ======================== 密度感知降采样 ========================
 
-def density_aware_downsample(points, colors, target_n, density_k=16):
+def density_aware_downsample(points, colors, target_n, normals=None, density_k=16):
     """密度感知降采样：密集区域多删点，稀疏区域（如花瓣）几乎不删。
 
     策略：
@@ -284,7 +286,7 @@ def density_aware_downsample(points, colors, target_n, density_k=16):
     3. 按概率采样 target_n 个点
     """
     if len(points) <= target_n:
-        return points, colors
+        return (points, colors, normals) if normals is not None else (points, colors)
 
     n = len(points)
     # 计算局部密度：k 近邻平均距离越小 → 密度越高
@@ -308,7 +310,100 @@ def density_aware_downsample(points, colors, target_n, density_k=16):
 
     rng = np.random.default_rng(42)
     chosen = rng.choice(n, size=target_n, replace=False, p=prob)
+    if normals is not None:
+        return points[chosen], colors[chosen], normals[chosen]
     return points[chosen], colors[chosen]
+
+
+# ======================== 法向量估计 ========================
+
+def estimate_normals(points, k=20):
+    """PCA 局部平面拟合估计法向量。
+
+    对每个点取其 k 近邻，用协方差矩阵的最小特征值对应的特征向量
+    作为法向量（即局部平面法线）。
+
+    Args:
+        points: (N, 3) 点云坐标
+        k: 近邻数，默认 20
+
+    Returns:
+        normals: (N, 3) 单位法向量（方向未统一）
+    """
+    n = len(points)
+    if n < k + 1:
+        k = max(n - 1, 3)
+    if n < 3:
+        return np.ones_like(points)
+
+    tree = cKDTree(points)
+    _, idx = tree.query(points, k=k + 1)  # 第 0 列是自身
+    neighbors = points[idx[:, 1:]]        # (N, k, 3)，去掉自身
+
+    # 每个点对其近邻做 PCA：协方差矩阵最小特征值 → 法向量
+    centers = neighbors.mean(axis=1)      # (N, 3)
+    centered = neighbors - centers[:, None, :]  # (N, k, 3)
+
+    # 向量化协方差计算：对每个点求 3x3 协方差
+    # cov[i] = centered[i].T @ centered[i] / k
+    cov = np.einsum("nki,nkj->nij", centered, centered) / (k - 1)  # (N, 3, 3)
+
+    # 批量特征分解
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)  # (N, 3), (N, 3, 3)
+
+    # 最小特征值对应的特征向量（第一列，eigh 返回升序）
+    normals = eigenvectors[:, :, 0]  # (N, 3)
+
+    # 归一化（数值安全）
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = normals / np.maximum(norms, 1e-12)
+
+    return normals
+
+
+def orient_normals_towards_cameras(normals, points, valid_images,
+                                    images_info, K_cache=None):
+    """将法向量统一朝向相机方向。
+
+    对每个点，计算其到所有相机位置的视线方向，取平均视线方向。
+    若法向量与平均视线方向反向（点积 < 0），则翻转法向量。
+    这样所有法向量都指向"外侧"（面向相机）。
+
+    Args:
+        normals: (N, 3) 未统一朝向的单位法向量
+        points: (N, 3) 点云坐标
+        valid_images: 有效的图像名列表
+        images_info: {name: {R, t, camera_id}} 相机位姿
+
+    Returns:
+        normals: (N, 3) 统一朝向后（面向相机）的单位法向量
+    """
+    n = len(points)
+    if n == 0:
+        return normals
+
+    # 计算所有相机中心
+    cameras_C = []
+    for name in valid_images:
+        info = images_info[name]
+        R, t = info["R"], info["t"]
+        C = -R.T @ t  # 相机中心在世界坐标系
+        cameras_C.append(C)
+    cameras_C = np.array(cameras_C)  # (M, 3)
+
+    # 对每个点，计算到所有相机的平均视线方向
+    # 用 KDTree 找最近相机（近似），足够判断朝向
+    cam_tree = cKDTree(cameras_C)
+    _, nearest_cam_idx = cam_tree.query(points, k=1)
+    view_dirs = cameras_C[nearest_cam_idx] - points  # (N, 3)
+    view_dirs = view_dirs / np.maximum(np.linalg.norm(view_dirs, axis=1, keepdims=True), 1e-12)
+
+    # 若法向量与视线方向反向（点积 < 0），翻转
+    dot = np.sum(normals * view_dirs, axis=1)
+    flip = dot < 0
+    normals[flip] = -normals[flip]
+
+    return normals
 
 
 # ======================== 颜色提取（单视角，用于中间阶段） ========================
@@ -339,16 +434,19 @@ def extract_colors(img_path, K, R, t, pts3d, img_cache=None):
 
 # ======================== PLY 保存 ========================
 
-def save_ply(filepath, points, colors=None):
-    """保存点云为 .ply 文件（带 RGB 颜色）。"""
+def save_ply(filepath, points, colors=None, normals=None):
+    """保存点云为 .ply 文件（带 RGB 颜色和法向量）。"""
     n = len(points)
     has_color = colors is not None and len(colors) == n
+    has_normals = normals is not None and len(normals) == n
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
         f"element vertex {n}\n"
         "property float x\nproperty float y\nproperty float z\n"
     )
+    if has_normals:
+        header += "property float nx\nproperty float ny\nproperty float nz\n"
     if has_color:
         header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
     header += "end_header\n"
@@ -357,6 +455,8 @@ def save_ply(filepath, points, colors=None):
         f.write(header.encode("ascii"))
         for i in range(n):
             f.write(np.array(points[i], dtype=np.float32).tobytes())
+            if has_normals:
+                f.write(np.array(normals[i], dtype=np.float32).tobytes())
             if has_color:
                 f.write(np.array(colors[i], dtype=np.uint8).tobytes())
 
@@ -392,17 +492,12 @@ def preload_images(img_dir: Path, image_names: list, n_workers: int) -> dict:
     return {name: img for name, img in results if img is not None}
 
 
-# ======================== 单帧处理 ========================
+# ======================== 单帧处理（拆分为 GPU 阶段 + CPU 阶段，供流水线使用） ========================
 
-def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
-    """处理单帧：四阶段高可靠性 pipeline。
-
-    Phase 1: 两两匹配 → RANSAC → 三角化 → 角度/深度/重投影严格过滤
-    Phase 2: 体素合并去重 → 观测次数过滤（多对独立三角化确认）
-    Phase 3: 多视角可见性验证
-    Phase 4: 多视角颜色混合
+def _gpu_match(frame_id, frame_dir, cameras, images_info, model, cfg):
+    """Phase 1-GPU：图像预加载 + RoMa 特征匹配。
+    返回供 CPU 阶段使用的中间状态字典，失败时返回 None。
     """
-    # 兼容两种布局：frame_dir/images/ 或 frame_dir/ 直接存图
     img_dir = frame_dir / "images"
     if not img_dir.exists():
         img_dir = frame_dir
@@ -410,19 +505,32 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
     available = sorted(
         [f.name for f in img_dir.iterdir()
          if f.suffix.lower() in (".jpg", ".png", ".jpeg")],
-        key=lambda x: int(Path(x).stem),
+        key=lambda x: (0, int(Path(x).stem)) if Path(x).stem.isdigit() else (1, Path(x).stem),
     )
+    # 若实际文件名与 COLMAP images_info 键不匹配（如 0.png vs cam003frame001.png），
+    # 按相机 ID 排序后做位置映射
+    if available and not any(n in images_info for n in available):
+        sorted_db = sorted(images_info.keys(),
+                           key=lambda k: images_info[k]["camera_id"])
+        if len(available) == len(sorted_db):
+            images_info = {a: images_info[d] for a, d in zip(available, sorted_db)}
+            tqdm.write(f"  [帧 {frame_id}] 文件名不匹配，按相机ID位置映射 {len(available)} 张")
+        else:
+            tqdm.write(f"  [帧 {frame_id}] 图像数({len(available)})与"
+                       f"COLMAP记录({len(sorted_db)})不匹配，跳过")
+            return None
     valid_images = [n for n in available if n in images_info]
     if len(valid_images) < 2:
-        print(f"  [帧 {frame_id}] 有效图像不足 (< 2)，跳过")
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
+        tqdm.write(f"  [帧 {frame_id}] 有效图像不足 (< 2)，跳过")
+        return None
 
     n_workers = get_n_workers()
     tqdm.write(f"  [帧 {frame_id}] 预加载 {len(valid_images)} 张图像 (workers={n_workers})...")
     img_cache = preload_images(img_dir, valid_images, n_workers)
     if not img_cache:
-        print(f"  [帧 {frame_id}] 图像加载失败，跳过")
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
+        tqdm.write(f"  [帧 {frame_id}] 图像加载失败，跳过")
+        return None
+
     first_img = img_cache[valid_images[0]]
     actual_h, actual_w = first_img.shape[:2]
 
@@ -435,7 +543,6 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
 
     pairs = build_pairs(len(valid_images), cfg.neighbor_range)
 
-    # ==================== Phase 1-GPU: 逐对 RoMa 特征匹配（顺序） ====================
     match_data = []
     gpu_bar = tqdm(pairs, desc=f"  帧 {frame_id} Phase1-GPU", leave=False)
     for idx_i, idx_j in gpu_bar:
@@ -456,6 +563,39 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
         pts_i, pts_j = pts_i[cmask], pts_j[cmask]
         if len(pts_i) >= 8:
             match_data.append((ni, nj, pts_i, pts_j))
+
+    return dict(
+        frame_id=frame_id,
+        img_dir=img_dir,
+        valid_images=valid_images,
+        K_cache=K_cache,
+        match_data=match_data,
+        img_cache=img_cache,
+        actual_w=actual_w,
+        actual_h=actual_h,
+        images_info=images_info,
+    )
+
+
+def _cpu_phases(state, cfg):
+    """Phase 1-CPU ~ Phase 5：三角化、合并、可见性、颜色混合、法向量估计。
+    接收 _gpu_match() 返回的状态字典，返回 (points, colors, normals)。
+    """
+    if state is None:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
+
+    frame_id     = state["frame_id"]
+    img_dir      = state["img_dir"]
+    valid_images = state["valid_images"]
+    K_cache      = state["K_cache"]
+    match_data   = state["match_data"]
+    img_cache    = state["img_cache"]
+    actual_w     = state["actual_w"]
+    actual_h     = state["actual_h"]
+    images_info  = state["images_info"]
+
+    if not match_data:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
 
     # ==================== Phase 1-CPU: 并行三角化与过滤 ====================
     def _triangulate_pair(args):
@@ -480,19 +620,16 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
 
         pts3d = triangulate_points(Ki, Ri, ti, Kj, Rj, tj, in_i, in_j)
 
-        # 三角化角度过滤：角度太小时深度极不稳定
         angles = compute_triangulation_angles(Ri, ti, Rj, tj, pts3d)
         amask = angles >= cfg.min_angle
         n_angle = int(amask.sum())
         pts3d, in_i, in_j = pts3d[amask], in_i[amask], in_j[amask]
 
-        # 深度过滤
         dmask = filter_by_depth(Ri, ti, Rj, tj, pts3d, cfg.min_depth, cfg.max_depth)
         pts3d, in_i, in_j = pts3d[dmask], in_i[dmask], in_j[dmask]
         if len(pts3d) == 0:
             return None
 
-        # 严格重投影误差过滤
         rmask = filter_by_reprojection(Ki, Ri, ti, Kj, Rj, tj,
                                        in_i, in_j, pts3d, cfg.reproj_threshold)
         pts3d, in_i = pts3d[rmask], in_i[rmask]
@@ -502,6 +639,7 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
         clr = extract_colors(str(img_dir / ni), Ki, Ri, ti, pts3d, img_cache)
         return pts3d, clr, n_match, n_inlier, n_angle
 
+    n_workers = get_n_workers()
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         pair_results = list(tqdm(
             pool.map(_triangulate_pair, match_data),
@@ -523,13 +661,13 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
                    f"角度ok:{n_angle} 三角化:{len(pts3d)}")
 
     if not raw_pts:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
 
     all_pts = np.vstack(raw_pts)
     all_clr = np.vstack(raw_clr)
     tqdm.write(f"  [帧 {frame_id}] Phase1: {total_raw} 个原始点")
 
-    # ==================== Phase 2: 体素合并 + 观测次数过滤 ====================
+    # ==================== Phase 2 ====================
     merged_pts, merged_clr, obs = merge_and_count_observations(all_pts, all_clr)
     obs_mask = obs >= cfg.min_observations
     merged_pts, merged_clr = merged_pts[obs_mask], merged_clr[obs_mask]
@@ -537,9 +675,9 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
                f"(obs >= {cfg.min_observations})")
 
     if len(merged_pts) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
 
-    # ==================== Phase 3: 多视角可见性验证 ====================
+    # ==================== Phase 3 ====================
     vis_mask = multiview_visibility_filter(
         merged_pts, valid_images, K_cache, images_info,
         actual_w, actual_h, cfg.min_visible_views)
@@ -548,7 +686,7 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
                f"(>= {cfg.min_visible_views} views)")
 
     if len(merged_pts) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
 
     # ==================== Phase 4: 多视角颜色混合 ====================
     tqdm.write(f"  [帧 {frame_id}] Phase4: 多视角颜色混合...")
@@ -556,7 +694,19 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
         merged_pts, valid_images, K_cache, images_info,
         img_dir, actual_w, actual_h, img_cache)
 
-    return merged_pts, colors
+    # ==================== Phase 5: 法向量估计 ====================
+    tqdm.write(f"  [帧 {frame_id}] Phase5: 估计法向量 (k=20)...")
+    normals = estimate_normals(merged_pts, k=20)
+    normals = orient_normals_towards_cameras(
+        normals, merged_pts, valid_images, images_info)
+
+    return merged_pts, colors, normals
+
+
+def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
+    """顺序执行版（向后兼容）。流水线模式请直接调用 _gpu_match + _cpu_phases。"""
+    state = _gpu_match(frame_id, frame_dir, cameras, images_info, model, cfg)
+    return _cpu_phases(state, cfg)  # (points, colors, normals)
 
 
 # ======================== 主函数 ========================
@@ -627,7 +777,16 @@ def main():
     out_path.mkdir(parents=True, exist_ok=True)
 
     # ---- 1. 解析 COLMAP 相机参数 ----
-    sparse_dir = Path(args.sparse_dir) if args.sparse_dir else data_path / "sparse" / "0"
+    if args.sparse_dir:
+        sparse_dir = Path(args.sparse_dir)
+    else:
+        # 优先 sparse/（undistort_from_calib 输出），再尝试 sparse/0/（COLMAP 标准）
+        for _cand in [data_path / "sparse", data_path / "sparse" / "0"]:
+            if (_cand / "cameras.txt").exists():
+                sparse_dir = _cand
+                break
+        else:
+            sparse_dir = data_path / "sparse" / "0"  # fallback
     print(f"[1/4] 解析相机参数: {sparse_dir}")
     cameras = parse_cameras(sparse_dir / "cameras.txt")
     images_info = parse_images(sparse_dir / "images.txt")
@@ -641,29 +800,81 @@ def main():
     print(f"      模型就绪，设备: {dev}")
 
     # ---- 3. 确定帧列表 ----
-    # 兼容两种数据组织：
-    # 1) 多帧: data_dir/{1,2,3,...}/images
-    # 2) 单帧: data_dir/images
+    # 支持三种布局：
+    # A) data_dir/images/{frame_id}/  (undistort_from_calib 批量输出)
+    # B) data_dir/{frame_id}/images/  (旧版多帧)
+    # C) data_dir/images/             (单帧)
+    images_subdir = data_path / "images"
+    if images_subdir.exists():
+        _sub_dirs = [d for d in images_subdir.iterdir() if d.is_dir()]
+        if _sub_dirs:
+            # Layout A：images/ 下有子目录 → 多帧
+            frame_base = images_subdir
+            all_frame_ids = sorted(
+                [d.name for d in _sub_dirs],
+                key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
+            )
+        else:
+            # Layout C：images/ 下直接是图像 → 单帧
+            frame_base = data_path
+            all_frame_ids = ["."]
+    else:
+        # Layout B：data_dir/ 下有编号子目录
+        frame_base = data_path
+        all_frame_ids = sorted(
+            [d.name for d in data_path.iterdir()
+             if d.is_dir() and d.name.isdigit()],
+            key=lambda x: int(x),
+        )
+
     if args.frames:
         frame_ids = [s.strip() for s in args.frames.split(",")]
     else:
-        if (data_path / "images").exists():
-            frame_ids = ["."]
-        else:
-            frame_ids = sorted(
-                [d.name for d in data_path.iterdir()
-                 if d.is_dir() and d.name.isdigit()],
-                key=lambda x: int(x),
-            )
-    print(f"[3/4] 待处理帧: {len(frame_ids)} 帧")
+        frame_ids = all_frame_ids
+    print(f"[3/4] 待处理帧: {len(frame_ids)} 帧  (图像根目录: {frame_base})")
     print(f"      参数: samples={cfg.num_samples}, target={cfg.target_points}, "
           f"neighbors={cfg.neighbor_range}, "
           f"ransac_thr={cfg.ransac_threshold}, reproj_thr={cfg.reproj_threshold}")
 
-    # ---- 4. 逐帧处理 ----
-    print("[4/4] 开始重建 ...")
+    # ---- 4. 流水线处理：GPU 匹配与 CPU 后处理并行 ----
+    # 主线程：逐帧做 GPU 匹配 (_gpu_match)
+    # 后台线程：消费匹配结果，执行三角化/过滤/合并/颜色 + 去噪 + 保存
+    # CUDA 操作会释放 GIL，使后台线程真正与 GPU 并行运行。
+    import queue as _queue
+    import threading as _threading
+
+    _work_q: _queue.Queue = _queue.Queue(maxsize=2)   # 背压：防止 GPU 超前太多帧
+
+    def _cpu_worker():
+        while True:
+            item = _work_q.get()
+            if item is None:          # sentinel
+                break
+            out_idx, frame_tag, state = item
+            try:
+                points, colors, normals = _cpu_phases(state, cfg)
+                if len(points) == 0:
+                    tqdm.write(f"  [帧 {frame_tag}] 无有效三维点")
+                    continue
+                before = len(points)
+                points, colors, normals = statistical_outlier_removal(
+                    points, colors, normals, k=cfg.sor_k, std_mul=cfg.sor_std)
+                after_sor = len(points)
+                points, colors, normals = density_aware_downsample(
+                    points, colors, cfg.target_points, normals)
+                ply_path = out_path / f"{out_idx}.ply"
+                save_ply(ply_path, points, colors, normals)
+                tqdm.write(f"  [帧 {frame_tag}] 点数: {before} -> {after_sor}(去噪) "
+                           f"-> {len(points)}(降采样)  => {ply_path}")
+            except Exception as exc:
+                tqdm.write(f"  [帧 {frame_tag}] CPU 处理异常: {exc}")
+
+    _cpu_thread = _threading.Thread(target=_cpu_worker, daemon=True)
+    _cpu_thread.start()
+
+    print("[4/4] 开始重建 (GPU/CPU 流水线) ...")
     for out_idx, fid in enumerate(tqdm(frame_ids, desc="总进度"), start=1):
-        fdir = data_path if fid == "." else (data_path / fid)
+        fdir = frame_base if fid == "." else (frame_base / fid)
         frame_tag = "root" if fid == "." else fid
         has_images_subdir = (fdir / "images").exists()
         has_direct_images = fdir.exists() and (
@@ -673,26 +884,22 @@ def main():
             tqdm.write(f"  [帧 {frame_tag}] 目录不存在或无图像，跳过")
             continue
 
-        points, colors = process_frame(frame_tag, fdir, cameras, images_info, model, cfg)
+        # images.txt 中的键可能带帧前缀（如 "1/cam1.png"），转为局部文件名
+        prefix = fid + "/"
+        if fid != "." and any(k.startswith(prefix) for k in images_info):
+            frame_images_info = {k[len(prefix):]: v
+                                 for k, v in images_info.items()
+                                 if k.startswith(prefix)}
+        else:
+            frame_images_info = images_info
 
-        if len(points) == 0:
-            tqdm.write(f"  [帧 {frame_tag}] 无有效三维点")
-            continue
+        # GPU 阶段在主线程执行（CUDA 操作期间 GIL 释放，CPU 线程可并行运行）
+        state = _gpu_match(frame_tag, fdir, cameras, frame_images_info, model, cfg)
+        # 阻塞直到队列有空位（即 CPU 线程已开始处理前一帧，自然形成背压）
+        _work_q.put((out_idx, frame_tag, state))
 
-        before = len(points)
-
-        # 统计离群值去除
-        points, colors = statistical_outlier_removal(
-            points, colors, k=cfg.sor_k, std_mul=cfg.sor_std)
-        after_sor = len(points)
-
-        # 密度感知降采样：密集区域多删，稀疏区域（花瓣）保留
-        points, colors = density_aware_downsample(points, colors, cfg.target_points)
-
-        ply_path = out_path / f"{out_idx}.ply"
-        save_ply(ply_path, points, colors)
-        tqdm.write(f"  [帧 {frame_tag}] 点数: {before} -> {after_sor}(去噪) -> {len(points)}(降采样)  "
-                   f"=> {ply_path}")
+    _work_q.put(None)       # sentinel：通知 CPU 线程退出
+    _cpu_thread.join()      # 等待最后一帧完成
 
     print("\n全部完成！输出目录:", out_path.resolve())
 

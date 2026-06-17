@@ -4,8 +4,8 @@
 Batch-crop PLY point cloud files using ranges from crop_range.txt.
 
 Usage:
-    python crop_ply_batch.py  crop_range.txt  <input_folder>
-    python crop_ply_batch.py  crop_range.txt  <input_folder>  <output_folder> --invert
+    python points/crop_ply_batch.py  crop_range.txt  <input_folder>
+    python points/crop_ply_batch.py  crop_range.txt  <input_folder>  <output_folder> --invert
 
 If output_folder is omitted, a sibling folder named <input_folder>_cropped is created.
 """

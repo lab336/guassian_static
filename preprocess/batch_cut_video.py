@@ -27,6 +27,9 @@
   --start_idx   : 视频/摄像头编号的起始值（默认 1，用于多批次续接编号）
 
 优先级：先按 target_fps 降采样，再按 num_frames 限制总帧数。
+
+示例：
+    python preprocess/batch_cut_video.py --data_dir ./videos --output_dir ./frames --num_frames 100 --target_fps 30 --sample_mode uniform --ext .mp4 --output_mode both --workers 4 --use_seek
 """
 
 import os
@@ -157,10 +160,10 @@ def process_video(task: dict) -> int:
                 if not ret:
                     continue
                 if need_bv:
-                    _write_safe(os.path.join(bv_subdir, f"{frame_seq + start_idx - 1}.jpg"), frame)
+                    _write_safe(os.path.join(bv_subdir, f"{frame_seq + start_idx - 1:03d}.png"), frame)
                 if need_bf:
                     _write_safe(os.path.join(by_frame_dir, str(frame_seq),
-                                             f"{video_idx}.jpg"), frame)
+                                             f"{video_idx:03d}.png"), frame)
                 frame_count = frame_seq
                 if frame_seq % report_every == 0 or frame_seq == actual:
                     print(f"  [{video_idx:03d}] 进度：{frame_seq}/{actual} 帧",
@@ -187,10 +190,10 @@ def process_video(task: dict) -> int:
                         break
                     frame_count += 1
                     if need_bv:
-                        _write_safe(os.path.join(bv_subdir, f"{frame_count + start_idx - 1}.jpg"), frame)
+                        _write_safe(os.path.join(bv_subdir, f"{frame_count + start_idx - 1:03d}.png"), frame)
                     if need_bf:
                         _write_safe(os.path.join(by_frame_dir, str(frame_count),
-                                                 f"{video_idx}.jpg"), frame)
+                                                 f"{video_idx:03d}.png"), frame)
                     if frame_count % report_every == 0 or frame_count == actual:
                         print(f"  [{video_idx:03d}] 进度：{frame_count}/{actual} 帧",
                               end="\r", flush=True)
@@ -222,24 +225,24 @@ def main():
     default_workers = max(1, cpu_count // 2)
 
     parser = argparse.ArgumentParser(description="批量提取视频帧（多进程加速版）")
-    parser.add_argument("--data_dir",    type=str, default="DJI/video/3.mp4",
+    parser.add_argument("--data_dir",    type=str, default="F:\\file\\output\\guassian_static\\data\\li_video\\ls",
                         help="视频所在目录")
     parser.add_argument("--start_idx",   type=int, default=1,
                         help="视频/摄像头编号的起始值（默认 1，可设为其他值以续接之前的批次）")
-    parser.add_argument("--output_dir",  type=str, default="DJI/images",
+    parser.add_argument("--output_dir",  type=str, default="F:\\file\\output\\guassian_static\\data\\li_video\\images",
                         help="输出根目录")
     parser.add_argument("--num_frames",  type=int, default=0,
                         help="每视频提取帧数（0=全部）")
-    parser.add_argument("--target_fps",  type=float, default=3,
+    parser.add_argument("--target_fps",  type=float, default=0,
                         help="目标帧率（如原始120fps设30则每秒取30帧，0=不限）")
     parser.add_argument("--sample_mode", type=str, default="uniform",
                         choices=["uniform", "head"],
                         help="采样方式：uniform=均匀采样，head=严格前N帧")
     parser.add_argument("--ext",         type=str, default=".mp4",
                         help="视频文件扩展名")
-    parser.add_argument("--output_mode", type=str, default="by_video",
+    parser.add_argument("--output_mode", type=str, default="by_frame",
                         choices=["by_video", "by_frame", "both"],
-                        help="输出组织方式：by_video / by_frame / both（默认 by_video）")
+                        help="输出组织方式：by_video / by_frame / both（默认 by_frame）")
     parser.add_argument("--workers",     type=int, default=default_workers,
                         help=f"并行处理视频的进程数（默认 {default_workers}）")
     parser.add_argument("--use_seek",    action="store_true",
