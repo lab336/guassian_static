@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Add-Type -AssemblyName System.Drawing; $f = \"f:\\\\file\\\\output\\\\guassian_static\\\\data\\\\twopeople\\\\images\\\\1\\\\1.png\"; $img = [System.Drawing.Image]::FromFile\\($f\\); \"1.png: $\\($img.Width\\) x $\\($img.Height\\)\"; $img.Dispose\\(\\); \"frames: \" + \\(\\(Get-ChildItem 'f:\\\\file\\\\output\\\\guassian_static\\\\data\\\\twopeople\\\\images' -Directory\\).Count\\); \"flow dirs: \" + \\(\\(Get-ChildItem 'f:\\\\file\\\\output\\\\guassian_static\\\\data\\\\twopeople\\\\flows' -Directory | Select-Object -First 8 | ForEach-Object Name\\) -join ', '\\))"
+    ]
+  }
+}

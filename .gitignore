@@ -10,4 +10,4 @@ data/*
 video/*
 frames1/*
 DJI/*
-colmap/*
+*.pyc

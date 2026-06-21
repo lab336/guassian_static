@@ -1,4 +1,4 @@
-r"""
+"""
 多相机三维点云重建 Pipeline
 从多相机去畸变图像 + 已知相机内外参，使用 RoMa v2 生成三维点云。
 
@@ -29,6 +29,11 @@ from tqdm import tqdm
 from romav2 import RoMaV2
 
 
+# 空帧返回值: (points, colors, normals, velocities)
+EMPTY_FRAME = (np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8),
+               np.zeros((0, 3)), None)
+
+
 # ======================== 配置 ========================
 
 @dataclass
@@ -37,7 +42,7 @@ class Config:
     data_dir: str = "images_processed"       # 数据根目录
     output_dir: str = "output"               # 输出目录
     num_samples: int = 5000                  # 每对图像采样匹配数
-    target_points: int = 50000               # 最终目标点数
+    target_points: int = 10000               # 最终目标点数
     min_confidence: float = 0.1              # RoMa overlap 置信度过滤阈值
     ransac_threshold: float = 1.0            # RANSAC 阈值 (像素，严格提高可靠性)
     reproj_threshold: float = 2.0            # 逐对重投影误差阈值 (像素，严格)
@@ -51,6 +56,17 @@ class Config:
     sor_std: float = 3.0                     # 统计离群值去除 - 标准差倍数
     roma_setting: str = "fast"               # RoMa v2 模式: turbo/fast/base/precise
     compile: bool = False                    # torch.compile (Windows 须关闭)
+    # ---- 光流速度估计 ----
+    compute_velocity: bool = True            # 是否用光流为每个点估计初始速度
+    flow_dir_name: str = "flow"              # 光流根目录名 (data_dir/flow/<frame>/<cam>.npy)
+    flow_format: str = "norm"                # 光流归一化方式: norm(占图像比例)/midnorm([-1,1])/pixel(像素)
+    velocity_dt: float = 1.0                 # 帧间时间间隔，速度 = (X' - X) / dt
+    velocity_min_views: int = 2              # 估计速度所需的最少有效视角数
+    velocity_reproj_thr: float = 3.0         # 速度三角化重投影离群阈值 (像素)
+    # ---- 重要性感知降采样 ----
+    importance_gamma: float = 3.0            # 重要性聚焦度：越大越偏向相机中心区域
+    importance_power: float = 2.0            # 采样权重的重要性指数
+    importance_density_weight: float = 0.3   # 稀疏度权重（保留花瓣等细小结构）
 
 
 # ======================== COLMAP 文件解析 ========================
@@ -116,6 +132,26 @@ def scale_intrinsics(K: np.ndarray, colmap_w: int, colmap_h: int,
     K_scaled[0, :] *= sx
     K_scaled[1, :] *= sy
     return K_scaled
+
+
+# ======================== 投影工具 ========================
+
+def build_projection_cache(valid_images, K_cache, images_info):
+    """一次性算好每个相机的 3x4 投影矩阵 P = K [R|t]，供多处复用。"""
+    P_cache = {}
+    for name in valid_images:
+        info = images_info[name]
+        P_cache[name] = K_cache[name] @ np.hstack(
+            [info["R"], info["t"].reshape(3, 1)])
+    return P_cache
+
+
+def project(P, pts):
+    """用 3x4 投影矩阵 P 投影 (N,3) 点。返回 (u, v, depth)。"""
+    pc = pts @ P[:, :3].T + P[:, 3]            # (N,3)
+    depth = pc[:, 2]
+    safe = np.where(depth > 1e-9, depth, 1.0)
+    return pc[:, 0] / safe, pc[:, 1] / safe, depth
 
 
 # ======================== 三角化与过滤 ========================
@@ -196,58 +232,40 @@ def merge_and_count_observations(points, colors):
     return merged_pts, merged_clr, counts
 
 
-def multiview_visibility_filter(pts3d, valid_images, K_cache, images_info,
+def multiview_visibility_filter(pts3d, valid_images, P_cache,
                                 actual_w, actual_h, min_views):
     """保留能被至少 min_views 个相机看到（正深度 + 画面内）的点。"""
-    n = len(pts3d)
-    if n == 0:
+    if len(pts3d) == 0:
         return np.ones(0, dtype=bool)
-    visible = np.zeros(n, dtype=int)
-    h = np.hstack([pts3d, np.ones((n, 1))]).T  # 4xN
+    visible = np.zeros(len(pts3d), dtype=int)
     for name in valid_images:
-        info = images_info[name]
-        K = K_cache[name]
-        R, t = info["R"], info["t"]
-        P = K @ np.hstack([R, t.reshape(3, 1)])
-        proj = P @ h  # 3xN
-        depth = proj[2]
-        safe_d = np.where(depth > 0, depth, 1.0)
-        u, v = proj[0] / safe_d, proj[1] / safe_d
-        in_view = ((depth > 0) & (u >= 0) & (u < actual_w)
-                   & (v >= 0) & (v < actual_h))
-        visible += in_view.astype(int)
+        u, v, depth = project(P_cache[name], pts3d)
+        visible += ((depth > 0) & (u >= 0) & (u < actual_w)
+                    & (v >= 0) & (v < actual_h))
     return visible >= min_views
 
 
-def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
-                          img_dir, actual_w, actual_h, img_cache=None):
+def multiview_color_blend(pts3d, valid_images, P_cache, img_dir,
+                          actual_w, actual_h, img_cache=None):
     """从所有可见视角混合提取颜色（比单视角更稳健）。"""
     n = len(pts3d)
     if n == 0:
         return np.zeros((0, 3), dtype=np.uint8)
     color_sum = np.zeros((n, 3), dtype=np.float64)
     color_cnt = np.zeros(n, dtype=int)
-    h = np.hstack([pts3d, np.ones((n, 1))]).T
     for name in valid_images:
-        info = images_info[name]
-        K = K_cache[name]
-        R, t = info["R"], info["t"]
-        P = K @ np.hstack([R, t.reshape(3, 1)])
-        proj = P @ h
-        depth = proj[2]
-        safe_d = np.where(depth > 0, depth, 1.0)
-        u = np.round(proj[0] / safe_d).astype(int)
-        v = np.round(proj[1] / safe_d).astype(int)
+        u, v, depth = project(P_cache[name], pts3d)
+        u = np.round(u).astype(int)
+        v = np.round(v).astype(int)
         if img_cache is not None and name in img_cache:
             img_rgb = img_cache[name]
-            h_img, w_img = img_rgb.shape[:2]
         else:
             img = cv2.imread(str(img_dir / name))
             if img is None:
                 continue
-            h_img, w_img = img.shape[:2]
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         # 按当前图像真实尺寸判断可见性，避免不同分辨率图像导致越界索引。
+        h_img, w_img = img_rgb.shape[:2]
         valid = ((depth > 0) & (u >= 0) & (u < w_img)
                  & (v >= 0) & (v < h_img))
         if not np.any(valid):
@@ -261,58 +279,102 @@ def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
 
 # ======================== 点云去噪 ========================
 
-def statistical_outlier_removal(points, colors, normals=None, k=20, std_mul=2.0):
+def _apply_selection(sel, points, colors, normals, velocities):
+    """按布尔掩码 / 索引数组 sel 选取各属性。
+
+    始终返回 (points, colors, normals, velocities) 四元组；为 None 的属性原样
+    透传 None（不参与索引），便于调用方统一解包。
+    """
+    return (
+        points[sel],
+        colors[sel],
+        None if normals is None else normals[sel],
+        None if velocities is None else velocities[sel],
+    )
+
+
+def statistical_outlier_removal(points, colors, normals=None, velocities=None,
+                                k=20, std_mul=2.0):
     """统计离群值去除：剔除到 k 近邻平均距离异常大的点。"""
     if len(points) < k + 1:
-        return (points, colors, normals) if normals is not None else (points, colors)
+        return _apply_selection(slice(None), points, colors, normals, velocities)
     tree = cKDTree(points)
     dists, _ = tree.query(points, k=k + 1)
     mean_d = dists[:, 1:].mean(axis=1)
     thr = mean_d.mean() + std_mul * mean_d.std()
     mask = mean_d < thr
-    if normals is not None:
-        return points[mask], colors[mask], normals[mask]
-    return points[mask], colors[mask]
+    return _apply_selection(mask, points, colors, normals, velocities)
 
 
-# ======================== 密度感知降采样 ========================
+# ======================== 区域重要性 ========================
 
-def density_aware_downsample(points, colors, target_n, normals=None, density_k=16):
-    """密度感知降采样：密集区域多删点，稀疏区域（如花瓣）几乎不删。
+def build_importance_model(images_info):
+    """从相机几何构建「区域重要性模型」（只需算一次，各帧通用）。
 
-    策略：
-    1. 用 KDTree 计算每个点的局部密度（k 近邻平均距离的倒数）
-    2. 采样概率 ∝ 1/density（稀疏点概率高，密集点概率低）
-    3. 按概率采样 target_n 个点
+    多相机环拍时所有相机大致朝向同一关注区域（被摄主体）。每个相机的光轴
+    （世界系方向）会在主体处汇聚。故记录每个相机的中心 C 与光轴方向 axis，
+    后续即可对任意三维点打分：越接近多数相机光轴/画面中心的点越重要。
+
+    返回 {"C": (M,3), "axis": (M,3)}。
     """
-    if len(points) <= target_n:
-        return (points, colors, normals) if normals is not None else (points, colors)
+    C, axis = [], []
+    for info in images_info.values():
+        R, t = info["R"], info["t"]
+        C.append(-R.T @ t)        # 相机中心（世界系）
+        axis.append(R[2])         # 光轴方向 = R^T @ [0,0,1] = R 的第三行
+    C = np.asarray(C, dtype=np.float64)
+    axis = np.asarray(axis, dtype=np.float64)
+    axis /= np.maximum(np.linalg.norm(axis, axis=1, keepdims=True), 1e-12)
+    return {"C": C, "axis": axis}
 
+
+def compute_importance(points, model, gamma=3.0):
+    """对每个点计算区域重要性得分（0~1）。
+
+    对每个相机，点的视线方向与该相机光轴夹角越小（越靠近画面中心）得分越高；
+    再对所有相机求和——被许多相机「正对中心」看到的区域（主体）得分最高。
+    gamma 越大越向中心聚焦。
+    """
+    if len(points) == 0:
+        return np.zeros(0)
+    score = np.zeros(len(points))
+    for c, a in zip(model["C"], model["axis"]):
+        v = points - c
+        cos = (v @ a) / np.maximum(np.linalg.norm(v, axis=1), 1e-12)
+        score += np.clip(cos, 0.0, None) ** gamma
+    mx = score.max()
+    return score / mx if mx > 0 else score
+
+
+# ======================== 重要性感知降采样 ========================
+
+def importance_aware_downsample(points, colors, target_n, importance,
+                                normals=None, velocities=None, density_k=16,
+                                imp_power=2.0, density_weight=0.3, floor=0.02):
+    """按「区域重要性 + 局部稀疏度」加权采样，优先保留主体与细小结构。
+
+    采样权重 = 重要性^imp_power + density_weight * 归一化稀疏度 + floor。
+      - 重要性项：让相机关注的中心区域（主体）保留更密；
+      - 稀疏度项：让花瓣等细小漂浮结构不被整体删光；
+      - floor：给背景留极小保留概率，避免完全消失。
+    """
     n = len(points)
-    # 计算局部密度：k 近邻平均距离越小 → 密度越高
-    tree = cKDTree(points)
-    k = min(density_k, n - 1)
-    dists, _ = tree.query(points, k=k + 1)  # 第 0 列是自身(距离=0)
-    mean_dist = dists[:, 1:].mean(axis=1)    # 每个点到 k 近邻的平均距离
+    if n <= target_n:
+        return _apply_selection(slice(None), points, colors, normals, velocities)
 
-    # 避免除零
-    mean_dist = np.maximum(mean_dist, 1e-10)
+    weights = importance ** imp_power
+    if density_weight > 0:
+        tree = cKDTree(points)
+        k = min(density_k, n - 1)
+        dists, _ = tree.query(points, k=k + 1)
+        mean_dist = dists[:, 1:].mean(axis=1)
+        weights = weights + density_weight * (mean_dist / mean_dist.max())
+    weights = weights + floor
 
-    # 采样权重 = 平均距离（稀疏的点距离大 → 权重大 → 更容易被保留）
-    weights = mean_dist.copy()
-
-    # 对最稀疏的 10% 点额外加权，确保花瓣等漂浮物被保留
-    sparse_threshold = np.percentile(weights, 90)
-    weights[weights >= sparse_threshold] *= 3.0
-
-    # 归一化为概率
     prob = weights / weights.sum()
-
     rng = np.random.default_rng(42)
     chosen = rng.choice(n, size=target_n, replace=False, p=prob)
-    if normals is not None:
-        return points[chosen], colors[chosen], normals[chosen]
-    return points[chosen], colors[chosen]
+    return _apply_selection(chosen, points, colors, normals, velocities)
 
 
 # ======================== 法向量估计 ========================
@@ -406,6 +468,168 @@ def orient_normals_towards_cameras(normals, points, valid_images,
     return normals
 
 
+# ======================== 光流速度估计 ========================
+
+def load_flow_maps(flow_dir: Path, valid_images: list, n_workers: int) -> dict:
+    """并行加载每个相机的光流 .npy，返回 {image_name: flow (H,W,2) float32}。
+
+    光流文件名与图像同名（去扩展名），如 1.png -> 1.npy。
+    """
+    def _load(name):
+        npy = flow_dir / (Path(name).stem + ".npy")
+        if not npy.exists():
+            return name, None
+        try:
+            arr = np.load(str(npy))
+        except Exception:
+            return name, None
+        if arr.ndim != 3 or arr.shape[2] != 2:
+            return name, None
+        return name, arr.astype(np.float32)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        results = list(pool.map(_load, valid_images))
+    return {name: flow for name, flow in results if flow is not None}
+
+
+def _bilinear_sample_flow(flow, u, v):
+    """在 (H,W,2) 光流图上对浮点像素坐标 (u,v) 做双线性采样。
+
+    返回 (du, dv, mask)，mask 标记落在图像内且数值有效的点。
+    """
+    H, W = flow.shape[:2]
+    inside = (u >= 0) & (u <= W - 1) & (v >= 0) & (v <= H - 1)
+    uu = np.clip(u, 0, W - 1)
+    vv = np.clip(v, 0, H - 1)
+    x0 = np.floor(uu).astype(np.int64)
+    y0 = np.floor(vv).astype(np.int64)
+    x1 = np.minimum(x0 + 1, W - 1)
+    y1 = np.minimum(y0 + 1, H - 1)
+    wx = (uu - x0)[:, None]
+    wy = (vv - y0)[:, None]
+    f00 = flow[y0, x0]; f01 = flow[y0, x1]
+    f10 = flow[y1, x0]; f11 = flow[y1, x1]
+    top = f00 * (1 - wx) + f01 * wx
+    bot = f10 * (1 - wx) + f11 * wx
+    f = top * (1 - wy) + bot * wy
+    finite = np.isfinite(f).all(axis=1)
+    return f[:, 0], f[:, 1], inside & finite
+
+
+def _flow_to_pixel(du_n, dv_n, flow_w, flow_h, actual_w, actual_h, fmt):
+    """将光流原始值转换为「实际图像」坐标系下的像素位移。"""
+    if fmt == "norm":          # 占图像尺寸的比例
+        return du_n * actual_w, dv_n * actual_h
+    if fmt == "midnorm":       # 归一化到 [-1, 1]
+        return du_n * actual_w / 2.0, dv_n * actual_h / 2.0
+    # "pixel"：光流图分辨率下的像素位移，按比例缩放到实际图像
+    return du_n * (actual_w / flow_w), dv_n * (actual_h / flow_h)
+
+
+def compute_flow_velocities(pts3d, valid_images, P_cache,
+                            flow_cache, actual_w, actual_h, cfg):
+    """用多视角光流为每个 3D 点估计初始速度。
+
+    相机是静止的（各帧共用同一组内外参），场景在运动。对每个点 X：
+      1. 投影到每个可见相机得到亚像素坐标 p_c；
+      2. 在该相机的光流图上双线性采样，得到下一帧投影 p_c' = p_c + flow；
+      3. 由于相机不动，{p_c'} 是下一帧位置 X' 在各相机的投影，
+         用所有视角联合线性三角化（DLT）求 X'（多相机平均，抑制光流噪声）；
+      4. velocity = (X' - X) / dt。
+
+    并做一次「重投影离群剔除 + 重三角化」以排除遮挡 / 错误光流的视角。
+
+    返回 (velocities (N,3) float32, valid_mask (N,) bool)。无效点速度为 0。
+    """
+    n = len(pts3d)
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=bool)
+
+    pts = pts3d.astype(np.float64)
+
+    # 预计算每个视角的投影矩阵、采样得到的下一帧像素 (up, vp) 及有效性
+    views = []
+    for name in valid_images:
+        flow = flow_cache.get(name)
+        if flow is None:
+            continue
+        P = P_cache[name]
+        u, v, depth = project(P, pts)
+        in_img = ((depth > 1e-6) & (u >= 0) & (u < actual_w)
+                  & (v >= 0) & (v < actual_h))
+
+        Hf, Wf = flow.shape[:2]
+        fu = u * (Wf / actual_w)
+        fv = v * (Hf / actual_h)
+        du_n, dv_n, sok = _bilinear_sample_flow(flow, fu, fv)
+        du, dv = _flow_to_pixel(du_n, dv_n, Wf, Hf, actual_w, actual_h,
+                                cfg.flow_format)
+        up = u + du
+        vp = v + dv
+        valid = in_img & sok & np.isfinite(up) & np.isfinite(vp)
+        if not np.any(valid):
+            continue
+        views.append((P, up, vp, valid))
+
+    if not views:
+        return np.zeros((n, 3), dtype=np.float32), np.zeros(n, dtype=bool)
+
+    def _triangulate_next(gate_pts, gate_thr):
+        """累积法方程并求解每个点的下一帧位置。
+
+        gate_pts 不为 None 时，用其重投影残差剔除离群视角。
+        """
+        M = np.zeros((n, 3, 3))
+        rhs = np.zeros((n, 3))
+        count = np.zeros(n, dtype=np.int64)
+        for P, up, vp, valid in views:
+            w = valid.copy()
+            if gate_pts is not None:
+                gu, gv, gd = project(P, gate_pts)
+                resid = np.hypot(gu - up, gv - vp)
+                w = w & (gd > 1e-6) & (resid < gate_thr)
+            wf = w.astype(np.float64)
+            # 每个视角两条方程: up*P3 - P1 = 0, vp*P3 - P2 = 0
+            for obs, Prow_idx in ((up, 0), (vp, 1)):
+                row = obs[:, None] * P[2][None, :] - P[Prow_idx][None, :]  # (N,4)
+                rn = np.linalg.norm(row, axis=1, keepdims=True)
+                rn[rn == 0] = 1.0
+                row = row / rn                       # 行归一化改善条件数
+                a = row[:, :3]
+                b = -row[:, 3]
+                M += wf[:, None, None] * (a[:, :, None] * a[:, None, :])
+                rhs += wf[:, None] * (a * b[:, None])
+            count += w
+        ok = count >= cfg.velocity_min_views
+        Xnext = pts.copy()
+        if np.any(ok):
+            Mr = M[ok] + np.eye(3)[None] * 1e-9
+            rok = rhs[ok][..., None]              # (K,3,1)
+            # 用行列式判退化（视线近共线），避免批量 solve 因个别奇异矩阵整体失败
+            dets = np.linalg.det(Mr)
+            good = np.abs(dets) > 1e-12
+            sol = pts[ok].copy()
+            if np.any(good):
+                sol[good] = np.linalg.solve(Mr[good], rok[good])[..., 0]
+            Xnext[ok] = sol
+            idx = np.where(ok)[0]
+            ok[idx[~good]] = False                # 退化点标记为无效
+        return Xnext, ok
+
+    # IRLS 式逐步收紧的重投影门限：先用全部视角得到粗估，再以逐渐减小的
+    # 阈值剔除离群视角并重三角化。相比单次硬门限，对遮挡 / 错误光流（哪怕
+    # 占比很高）都能稳健收敛，而干净点的精度不受影响。
+    thr = cfg.velocity_reproj_thr
+    schedule = [None, 16.0 * thr, 5.0 * thr, 1.67 * thr, thr]
+    Xnext, valid_mask = _triangulate_next(None, None)
+    for gate_thr in schedule[1:]:
+        Xnext, valid_mask = _triangulate_next(Xnext, gate_thr)
+
+    velocities = np.zeros((n, 3), dtype=np.float64)
+    velocities[valid_mask] = (Xnext[valid_mask] - pts[valid_mask]) / cfg.velocity_dt
+    return velocities.astype(np.float32), valid_mask
+
+
 # ======================== 颜色提取（单视角，用于中间阶段） ========================
 
 def extract_colors(img_path, K, R, t, pts3d, img_cache=None):
@@ -434,11 +658,12 @@ def extract_colors(img_path, K, R, t, pts3d, img_cache=None):
 
 # ======================== PLY 保存 ========================
 
-def save_ply(filepath, points, colors=None, normals=None):
-    """保存点云为 .ply 文件（带 RGB 颜色和法向量）。"""
+def save_ply(filepath, points, colors=None, normals=None, velocities=None):
+    """保存点云为 .ply 文件（带 RGB 颜色、法向量、初始速度 vx/vy/vz）。"""
     n = len(points)
     has_color = colors is not None and len(colors) == n
     has_normals = normals is not None and len(normals) == n
+    has_velocity = velocities is not None and len(velocities) == n
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -447,18 +672,36 @@ def save_ply(filepath, points, colors=None, normals=None):
     )
     if has_normals:
         header += "property float nx\nproperty float ny\nproperty float nz\n"
+    if has_velocity:
+        header += "property float vx\nproperty float vy\nproperty float vz\n"
     if has_color:
         header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
     header += "end_header\n"
 
+    # 向量化打包为单块缓冲区，比逐点写入快很多
+    pts = np.ascontiguousarray(points, dtype=np.float32)
+    blocks = [pts]
+    if has_normals:
+        blocks.append(np.ascontiguousarray(normals, dtype=np.float32))
+    if has_velocity:
+        blocks.append(np.ascontiguousarray(velocities, dtype=np.float32))
+    float_part = np.hstack(blocks)  # (N, 3*k) float32
+
+    if has_color:
+        clr = np.ascontiguousarray(colors, dtype=np.uint8)
+        # 构造结构化记录: 若干 float32 + 3 uchar
+        n_floats = float_part.shape[1]
+        dt = np.dtype([("f", np.float32, n_floats), ("c", np.uint8, 3)])
+        rec = np.empty(n, dtype=dt)
+        rec["f"] = float_part
+        rec["c"] = clr
+        payload = rec.tobytes()
+    else:
+        payload = float_part.tobytes()
+
     with open(filepath, "wb") as f:
         f.write(header.encode("ascii"))
-        for i in range(n):
-            f.write(np.array(points[i], dtype=np.float32).tobytes())
-            if has_normals:
-                f.write(np.array(normals[i], dtype=np.float32).tobytes())
-            if has_color:
-                f.write(np.array(colors[i], dtype=np.uint8).tobytes())
+        f.write(payload)
 
 
 # ======================== 配对策略 ========================
@@ -582,7 +825,7 @@ def _cpu_phases(state, cfg):
     接收 _gpu_match() 返回的状态字典，返回 (points, colors, normals)。
     """
     if state is None:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
+        return EMPTY_FRAME
 
     frame_id     = state["frame_id"]
     img_dir      = state["img_dir"]
@@ -595,7 +838,10 @@ def _cpu_phases(state, cfg):
     images_info  = state["images_info"]
 
     if not match_data:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
+        return EMPTY_FRAME
+
+    # 投影矩阵只需算一次，供可见性 / 颜色 / 速度三阶段复用
+    P_cache = build_projection_cache(valid_images, K_cache, images_info)
 
     # ==================== Phase 1-CPU: 并行三角化与过滤 ====================
     def _triangulate_pair(args):
@@ -661,7 +907,7 @@ def _cpu_phases(state, cfg):
                    f"角度ok:{n_angle} 三角化:{len(pts3d)}")
 
     if not raw_pts:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
+        return EMPTY_FRAME
 
     all_pts = np.vstack(raw_pts)
     all_clr = np.vstack(raw_clr)
@@ -675,23 +921,23 @@ def _cpu_phases(state, cfg):
                f"(obs >= {cfg.min_observations})")
 
     if len(merged_pts) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
+        return EMPTY_FRAME
 
     # ==================== Phase 3 ====================
     vis_mask = multiview_visibility_filter(
-        merged_pts, valid_images, K_cache, images_info,
+        merged_pts, valid_images, P_cache,
         actual_w, actual_h, cfg.min_visible_views)
     merged_pts, merged_clr = merged_pts[vis_mask], merged_clr[vis_mask]
     tqdm.write(f"  [帧 {frame_id}] Phase3: 可见性 -> {len(merged_pts)} "
                f"(>= {cfg.min_visible_views} views)")
 
     if len(merged_pts) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8), np.zeros((0, 3))
+        return EMPTY_FRAME
 
     # ==================== Phase 4: 多视角颜色混合 ====================
     tqdm.write(f"  [帧 {frame_id}] Phase4: 多视角颜色混合...")
     colors = multiview_color_blend(
-        merged_pts, valid_images, K_cache, images_info,
+        merged_pts, valid_images, P_cache,
         img_dir, actual_w, actual_h, img_cache)
 
     # ==================== Phase 5: 法向量估计 ====================
@@ -700,13 +946,35 @@ def _cpu_phases(state, cfg):
     normals = orient_normals_towards_cameras(
         normals, merged_pts, valid_images, images_info)
 
-    return merged_pts, colors, normals
+    # ==================== Phase 6: 光流多视角速度估计 ====================
+    velocities = None
+    if cfg.compute_velocity:
+        flow_dir = Path(cfg.data_dir) / cfg.flow_dir_name / str(frame_id)
+        if not flow_dir.exists():
+            flow_dir = Path(cfg.data_dir) / cfg.flow_dir_name  # 单帧布局回退
+        if flow_dir.exists():
+            n_workers = get_n_workers()
+            flow_cache = load_flow_maps(flow_dir, valid_images, n_workers)
+            if flow_cache:
+                tqdm.write(f"  [帧 {frame_id}] Phase6: 光流速度估计 "
+                           f"(加载 {len(flow_cache)}/{len(valid_images)} 张光流)...")
+                velocities, vmask = compute_flow_velocities(
+                    merged_pts, valid_images, P_cache,
+                    flow_cache, actual_w, actual_h, cfg)
+                tqdm.write(f"  [帧 {frame_id}] Phase6: {int(vmask.sum())}/"
+                           f"{len(merged_pts)} 个点获得有效速度")
+            else:
+                tqdm.write(f"  [帧 {frame_id}] Phase6: 未找到匹配的光流文件，跳过速度")
+        else:
+            tqdm.write(f"  [帧 {frame_id}] Phase6: 光流目录不存在 ({flow_dir})，跳过速度")
+
+    return merged_pts, colors, normals, velocities
 
 
 def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
     """顺序执行版（向后兼容）。流水线模式请直接调用 _gpu_match + _cpu_phases。"""
     state = _gpu_match(frame_id, frame_dir, cameras, images_info, model, cfg)
-    return _cpu_phases(state, cfg)  # (points, colors, normals)
+    return _cpu_phases(state, cfg)  # (points, colors, normals, velocities)
 
 
 # ======================== 主函数 ========================
@@ -751,6 +1019,25 @@ def main():
                         help="COLMAP sparse/0 目录 (默认: data_dir/sparse/0)")
     parser.add_argument("--compile", action="store_true",
                         help="启用 torch.compile (需要 Triton)")
+    parser.add_argument("--no_velocity", action="store_true",
+                        help="不用光流估计每点初始速度")
+    parser.add_argument("--flow_dir_name", default="flow",
+                        help="光流根目录名 (data_dir/<flow_dir_name>/<frame>/<cam>.npy)")
+    parser.add_argument("--flow_format", default="norm",
+                        choices=["norm", "midnorm", "pixel"],
+                        help="光流归一化方式: norm(占图像比例)/midnorm([-1,1])/pixel(像素)")
+    parser.add_argument("--velocity_dt", type=float, default=1.0,
+                        help="帧间时间间隔, 速度=(X'-X)/dt (默认 1, 即每帧位移)")
+    parser.add_argument("--velocity_min_views", type=int, default=2,
+                        help="估计速度所需最少有效视角数")
+    parser.add_argument("--velocity_reproj_thr", type=float, default=3.0,
+                        help="速度三角化重投影离群阈值 (像素)")
+    parser.add_argument("--importance_gamma", type=float, default=3.0,
+                        help="重要性聚焦度: 越大越偏向相机中心区域")
+    parser.add_argument("--importance_power", type=float, default=2.0,
+                        help="降采样权重的重要性指数")
+    parser.add_argument("--importance_density_weight", type=float, default=0.3,
+                        help="降采样稀疏度权重 (保留花瓣等细小结构)")
     args = parser.parse_args()
 
     cfg = Config(
@@ -770,6 +1057,15 @@ def main():
         sor_std=args.sor_std,
         roma_setting=args.roma_setting,
         compile=args.compile,
+        compute_velocity=not args.no_velocity,
+        flow_dir_name=args.flow_dir_name,
+        flow_format=args.flow_format,
+        velocity_dt=args.velocity_dt,
+        velocity_min_views=args.velocity_min_views,
+        velocity_reproj_thr=args.velocity_reproj_thr,
+        importance_gamma=args.importance_gamma,
+        importance_power=args.importance_power,
+        importance_density_weight=args.importance_density_weight,
     )
 
     data_path = Path(cfg.data_dir)
@@ -845,6 +1141,9 @@ def main():
 
     _work_q: _queue.Queue = _queue.Queue(maxsize=2)   # 背压：防止 GPU 超前太多帧
 
+    # 区域重要性模型只需算一次（相机静止，关注区域固定），各帧通用
+    imp_model = build_importance_model(images_info)
+
     def _cpu_worker():
         while True:
             item = _work_q.get()
@@ -852,18 +1151,23 @@ def main():
                 break
             out_idx, frame_tag, state = item
             try:
-                points, colors, normals = _cpu_phases(state, cfg)
+                points, colors, normals, velocities = _cpu_phases(state, cfg)
                 if len(points) == 0:
                     tqdm.write(f"  [帧 {frame_tag}] 无有效三维点")
                     continue
                 before = len(points)
-                points, colors, normals = statistical_outlier_removal(
-                    points, colors, normals, k=cfg.sor_k, std_mul=cfg.sor_std)
+                points, colors, normals, velocities = statistical_outlier_removal(
+                    points, colors, normals, velocities,
+                    k=cfg.sor_k, std_mul=cfg.sor_std)
                 after_sor = len(points)
-                points, colors, normals = density_aware_downsample(
-                    points, colors, cfg.target_points, normals)
+                importance = compute_importance(points, imp_model,
+                                                gamma=cfg.importance_gamma)
+                points, colors, normals, velocities = importance_aware_downsample(
+                    points, colors, cfg.target_points, importance,
+                    normals, velocities, imp_power=cfg.importance_power,
+                    density_weight=cfg.importance_density_weight)
                 ply_path = out_path / f"{out_idx}.ply"
-                save_ply(ply_path, points, colors, normals)
+                save_ply(ply_path, points, colors, normals, velocities)
                 tqdm.write(f"  [帧 {frame_tag}] 点数: {before} -> {after_sor}(去噪) "
                            f"-> {len(points)}(降采样)  => {ply_path}")
             except Exception as exc:
