@@ -11,6 +11,7 @@ the database, then runs COLMAP mapper/model_converter.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import json
 import logging
@@ -20,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -369,6 +371,82 @@ def build_pairs(
     return normalized
 
 
+def build_rig_pairs(
+    ref_images: dict[int, "ColmapImage"],
+    ref_points: Sequence["ColmapPoint3D"],
+    names: Sequence[str],
+    top_k: int,
+    min_shared: int,
+    geo_neighbors: int,
+) -> list[tuple[str, str]]:
+    """Pick the camera pairs worth matching for a static rig, computed once from the
+    reference solve.
+
+    Combines two signals so the set stays valid even as subjects move between frames:
+      * covisibility -- cameras that share many reference 3D points;
+      * geometry -- each camera's nearest neighbours by viewing angle around the scene
+        centroid (covers overlaps that were textureless in the reference frame).
+    """
+    cam_index = {n: i for i, n in enumerate(names)}
+    m = len(names)
+    if m < 2:
+        return []
+    id_to_idx = {iid: cam_index[img.name] for iid, img in ref_images.items() if img.name in cam_index}
+
+    covis = np.zeros((m, m), dtype=np.int64)
+    for point in ref_points:
+        idxs = sorted({id_to_idx[iid] for iid, _ in point.track if iid in id_to_idx})
+        if len(idxs) >= 2:
+            arr = np.asarray(idxs, dtype=np.intp)
+            covis[np.ix_(arr, arr)] += 1
+    np.fill_diagonal(covis, 0)
+
+    neighbors: list[set[int]] = [set() for _ in range(m)]
+    for i in range(m):
+        row = covis[i]
+        cand = np.where(row >= max(min_shared, 1))[0]
+        if cand.size and top_k > 0:
+            ranked = cand[np.argsort(row[cand])[::-1]]
+            for j in ranked[:top_k]:
+                neighbors[i].add(int(j))
+
+    if geo_neighbors > 0 and len(ref_points) > 0:
+        centroid = np.mean(np.asarray([p.xyz for p in ref_points], dtype=np.float64), axis=0)
+        dirs = np.zeros((m, 3), dtype=np.float64)
+        have = np.zeros(m, dtype=bool)
+        for img in ref_images.values():
+            if img.name in cam_index:
+                i = cam_index[img.name]
+                center = -img.rotmat.T @ img.tvec
+                vec = center - centroid
+                norm = float(np.linalg.norm(vec))
+                dirs[i] = vec / norm if norm > 1e-9 else vec
+                have[i] = True
+        idx_have = np.where(have)[0]
+        for i in idx_have:
+            cos = dirs[idx_have] @ dirs[i]
+            ranked = idx_have[np.argsort(cos)[::-1]]
+            added = 0
+            for j in ranked:
+                if int(j) == int(i):
+                    continue
+                neighbors[i].add(int(j))
+                added += 1
+                if added >= geo_neighbors:
+                    break
+
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for i in range(m):
+        for j in neighbors[i]:
+            a, b = (i, j) if i < j else (j, i)
+            if a != b and (a, b) not in seen:
+                seen.add((a, b))
+                out.append((a, b))
+    out.sort()
+    return [(names[a], names[b]) for a, b in out]
+
+
 def process_resize(width: int, height: int, resize: Sequence[int]) -> tuple[int, int]:
     if len(resize) == 2:
         return int(resize[0]), int(resize[1])
@@ -391,6 +469,8 @@ class SuperGlueMatcher:
         sinkhorn_iterations: int,
         match_threshold: float,
         device: str,
+        fp16: bool = False,
+        tf32: bool = True,
     ) -> None:
         self.superglue_root = superglue_root.resolve()
         if not self.superglue_root.exists():
@@ -407,6 +487,13 @@ class SuperGlueMatcher:
         self.device = device
         self.resize = list(resize)
         self.resize_float = resize_float
+        # Camera input sizes repeat across frames, so let cuDNN autotune the best
+        # conv kernels once. Deterministic for a given size -> output is unchanged.
+        self.use_half = bool(fp16) and device == "cuda"
+        if device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
+            torch.backends.cudnn.allow_tf32 = bool(tf32)
         self.matching = Matching(
             {
                 "superpoint": {
@@ -422,41 +509,96 @@ class SuperGlueMatcher:
             }
         ).eval().to(device)
         self.torch.set_grad_enabled(False)
+        self._placeholders: dict[tuple[int, int], object] = {}
 
-    def _load_gray(self, path: Path) -> tuple[np.ndarray, tuple[float, float]]:
+    def _load_gray(self, path: Path, resize: Sequence[int] | None = None) -> tuple[np.ndarray, tuple[float, float], tuple[int, int]]:
         import cv2
 
         image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise RuntimeError(f"failed to read image: {path}")
         width, height = image.shape[1], image.shape[0]
-        new_width, new_height = process_resize(width, height, self.resize)
+        new_width, new_height = process_resize(width, height, self.resize if resize is None else list(resize))
         scales = (float(width) / float(new_width), float(height) / float(new_height))
         if (new_width, new_height) != (width, height):
             image = cv2.resize(image.astype("float32" if self.resize_float else "uint8"), (new_width, new_height))
-        return image, scales
+        return image, scales, (new_width, new_height)
 
-    def match_pair(self, image0: Path, image1: Path) -> np.ndarray:
-        img0, scales0 = self._load_gray(image0)
-        img1, scales1 = self._load_gray(image1)
-        tensor0 = self.torch.from_numpy(img0 / 255.0).float()[None, None].to(self.device)
-        tensor1 = self.torch.from_numpy(img1 / 255.0).float()[None, None].to(self.device)
-        pred = self.matching({"image0": tensor0, "image1": tensor1})
-        pred_np = {k: v[0].detach().cpu().numpy() for k, v in pred.items()}
-        kpts0 = pred_np["keypoints0"]
-        kpts1 = pred_np["keypoints1"]
-        matches = pred_np["matches0"]
+    def _shape_placeholder(self, shape: tuple[int, int]):
+        """A reusable (1, 1, H, W) tensor; SuperGlue only reads .shape for normalization."""
+        key = (int(shape[0]), int(shape[1]))
+        tensor = self._placeholders.get(key)
+        if tensor is None:
+            tensor = self.torch.empty((1, 1, key[0], key[1]), device=self.device)
+            self._placeholders[key] = tensor
+        return tensor
+
+    def _autocast(self):
+        """fp16 mixed precision for the heavy conv/matmul ops (Ampere/Ada speedup)."""
+        if self.use_half:
+            return self.torch.autocast(device_type="cuda", dtype=self.torch.float16)
+        return contextlib.nullcontext()
+
+    def _decode(self, path: Path, resize: Sequence[int] | None = None) -> dict:
+        """CPU-only image load + resize. Safe to run off the main thread (cv2 frees the GIL)."""
+        img, scales, (new_width, new_height) = self._load_gray(path, resize)
+        return {"img": img, "scales": scales, "shape": (new_height, new_width)}
+
+    def _encode(self, decoded: dict) -> dict:
+        """Run SuperPoint on a decoded image (GPU). Must be called on the CUDA thread."""
+        tensor = self.torch.from_numpy(decoded["img"] / 255.0).float()[None, None].to(
+            self.device, non_blocking=True
+        )
+        with self._autocast():
+            pred = self.matching.superpoint({"image": tensor})
+        # Keypoint coordinates reach ~4K and would lose precision in fp16 (exact ints
+        # only up to 2048), so always keep them fp32 even when the network runs in fp16.
+        keypoints = [k.float() for k in pred["keypoints"]]
+        return {
+            "keypoints": keypoints,              # list[Tensor(N, 2)] (resized-image coords)
+            "scores": pred["scores"],
+            "descriptors": pred["descriptors"],
+            "scales": decoded["scales"],
+            "shape": decoded["shape"],
+        }
+
+    def detect(self, path: Path, resize: Sequence[int] | None = None) -> dict:
+        """Run SuperPoint once for an image; the result is reused across all its pairs."""
+        return self._encode(self._decode(path, resize))
+
+    def match_cached(self, feat0: dict, feat1: dict) -> np.ndarray:
+        """Run only SuperGlue on two pre-detected feature sets."""
+        data = {
+            "image0": self._shape_placeholder(feat0["shape"]),
+            "image1": self._shape_placeholder(feat1["shape"]),
+            "keypoints0": feat0["keypoints"],
+            "scores0": feat0["scores"],
+            "descriptors0": feat0["descriptors"],
+            "keypoints1": feat1["keypoints"],
+            "scores1": feat1["scores"],
+            "descriptors1": feat1["descriptors"],
+        }
+        with self._autocast():
+            pred = self.matching(data)
+        kpts0 = feat0["keypoints"][0].detach().cpu().numpy()
+        kpts1 = feat1["keypoints"][0].detach().cpu().numpy()
+        matches = pred["matches0"][0].detach().cpu().numpy()
         valid = matches > -1
         if not np.any(valid):
             return np.empty((0, 4), dtype=np.float32)
 
         mkpts0 = kpts0[valid].astype(np.float32, copy=True)
         mkpts1 = kpts1[matches[valid]].astype(np.float32, copy=True)
+        scales0 = feat0["scales"]
+        scales1 = feat1["scales"]
         mkpts0[:, 0] *= scales0[0]
         mkpts0[:, 1] *= scales0[1]
         mkpts1[:, 0] *= scales1[0]
         mkpts1[:, 1] *= scales1[1]
         return np.concatenate([mkpts0, mkpts1], axis=1).astype(np.float32, copy=False)
+
+    def match_pair(self, image0: Path, image1: Path, resize: Sequence[int] | None = None) -> np.ndarray:
+        return self.match_cached(self.detect(image0, resize), self.detect(image1, resize))
 
 
 def filter_corrs(
@@ -615,33 +757,55 @@ def run_mapper(colmap: str, database_path: Path, image_dir: Path, sparse_dir: Pa
     if sparse_dir.exists():
         shutil.rmtree(sparse_dir)
     sparse_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        colmap,
-        "mapper",
-        "--database_path",
-        str(database_path),
-        "--image_path",
-        str(image_dir),
-        "--output_path",
-        str(sparse_dir),
-        "--Mapper.ba_refine_focal_length",
-        "1" if args.ba_refine_focal_length else "0",
-        "--Mapper.ba_refine_principal_point",
-        "1" if args.ba_refine_principal_point else "0",
-        "--Mapper.min_num_matches",
-        str(args.mapper_min_num_matches),
-        "--Mapper.init_min_num_inliers",
-        str(args.mapper_init_min_num_inliers),
-        "--Mapper.init_max_error",
-        str(args.mapper_init_max_error),
-        "--Mapper.abs_pose_min_num_inliers",
-        str(args.mapper_abs_pose_min_num_inliers),
-        "--Mapper.tri_min_angle",
-        str(args.mapper_tri_min_angle),
-        "--Mapper.multiple_models",
-        "1" if args.mapper_multiple_models else "0",
-    ]
-    run_command(cmd, log_dir / "mapper.log")
+
+    def build_mapper_cmd(multiple_models: bool) -> list[str]:
+        return [
+            colmap,
+            "mapper",
+            "--database_path",
+            str(database_path),
+            "--image_path",
+            str(image_dir),
+            "--output_path",
+            str(sparse_dir),
+            "--Mapper.ba_refine_focal_length",
+            "1" if args.ba_refine_focal_length else "0",
+            "--Mapper.ba_refine_principal_point",
+            "1" if args.ba_refine_principal_point else "0",
+            "--Mapper.min_num_matches",
+            str(args.mapper_min_num_matches),
+            "--Mapper.init_min_num_inliers",
+            str(args.mapper_init_min_num_inliers),
+            "--Mapper.init_max_error",
+            str(args.mapper_init_max_error),
+            "--Mapper.abs_pose_min_num_inliers",
+            str(args.mapper_abs_pose_min_num_inliers),
+            "--Mapper.tri_min_angle",
+            str(args.mapper_tri_min_angle),
+            "--Mapper.multiple_models",
+            "1" if multiple_models else "0",
+        ]
+
+    cmd = build_mapper_cmd(args.mapper_multiple_models)
+    try:
+        run_command(cmd, log_dir / "mapper.log")
+    except CommandError as exc:
+        message = str(exc)
+        ba_single_image_crash = (
+            "ba_config.NumImages() >= 2" in message
+            or "At least two images must be registered for global bundle-adjustment" in message
+        )
+        if not (args.mapper_multiple_models and ba_single_image_crash):
+            raise
+        LOGGER.warning(
+            "COLMAP mapper hit a multi-model global BA assertion; retrying as a single model "
+            "(--Mapper.multiple_models 0)."
+        )
+        if sparse_dir.exists():
+            shutil.rmtree(sparse_dir)
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+        run_command(build_mapper_cmd(False), log_dir / "mapper_retry_single_model.log")
+
     models = [p for p in sparse_dir.iterdir() if p.is_dir()]
     if not models:
         raise RuntimeError(f"COLMAP mapper produced no model in {sparse_dir}")
@@ -1083,6 +1247,7 @@ def write_points_ply(
     ply_path: Path,
     points: Sequence[ColmapPoint3D],
     velocity: VelocityResult | None,
+    ascii: bool = True,
 ) -> None:
     ply_path.parent.mkdir(parents=True, exist_ok=True)
     n = len(points)
@@ -1119,9 +1284,10 @@ def write_points_ply(
         data["velocity_confidence"] = velocity.confidence.astype(np.float32, copy=False)
         data["velocity_valid"] = velocity.valid.astype(np.uint8)
         data["velocity_views"] = velocity.view_counts.astype(np.uint8, copy=False)
+    fmt = "ascii 1.0" if ascii else "binary_little_endian 1.0"
     header = (
         "ply\n"
-        "format binary_little_endian 1.0\n"
+        f"format {fmt}\n"
         "comment velocity is estimated by multi-view optical-flow triangulation\n"
         "comment vx vy vz are in COLMAP world units per velocity_dt\n"
         f"element vertex {n}\n"
@@ -1141,7 +1307,17 @@ def write_points_ply(
     )
     with ply_path.open("wb") as f:
         f.write(header.encode("ascii"))
-        f.write(data.tobytes())
+        if not ascii:
+            f.write(data.tobytes())
+        elif n:
+            # One human-readable line per vertex. %.9g round-trips float32 exactly;
+            # color/flag columns print as integers.
+            row_fmt = "%.9g %.9g %.9g %d %d %d %.9g %.9g %.9g %.9g %d %d"
+            np.savetxt(
+                f,
+                np.array(data.tolist(), dtype=object),
+                fmt=row_fmt,
+            )
 
 
 def copy_sparse_model(model_dir: Path, output_root: Path, output_name: str, force: bool) -> Path:
@@ -1154,6 +1330,268 @@ def copy_sparse_model(model_dir: Path, output_root: Path, output_name: str, forc
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(model_dir, final_dir)
     return final_dir
+
+
+def camera_focal(camera: ColmapCamera) -> float:
+    return float(camera.params[0])
+
+
+def pixels_to_normalized(pts: np.ndarray, camera: ColmapCamera) -> np.ndarray:
+    """Convert pixel coordinates to undistorted normalized camera coordinates (batched)."""
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    p = camera.params
+    model = camera.model
+    if model == "SIMPLE_PINHOLE":
+        f, cx, cy = p[:3]
+        return np.column_stack(((pts[:, 0] - cx) / f, (pts[:, 1] - cy) / f))
+    if model == "PINHOLE":
+        fx, fy, cx, cy = p[:4]
+        return np.column_stack(((pts[:, 0] - cx) / fx, (pts[:, 1] - cy) / fy))
+
+    import cv2
+
+    if model == "SIMPLE_RADIAL":
+        f, cx, cy, k1 = p[:4]
+        k = np.asarray([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.asarray([k1, 0, 0, 0], dtype=np.float64)
+    elif model == "RADIAL":
+        f, cx, cy, k1, k2 = p[:5]
+        k = np.asarray([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.asarray([k1, k2, 0, 0], dtype=np.float64)
+    elif model == "OPENCV":
+        fx, fy, cx, cy, k1, k2, p1, p2 = p[:8]
+        k = np.asarray([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.asarray([k1, k2, p1, p2], dtype=np.float64)
+    else:
+        raise ValueError(f"unsupported camera model for epipolar filter: {model}")
+    und = cv2.undistortPoints(pts.reshape(-1, 1, 2), k, dist)
+    return und.reshape(-1, 2)
+
+
+def essential_matrix(img0: ColmapImage, img1: ColmapImage) -> np.ndarray:
+    """Essential matrix E with x1^T E x0 = 0 for normalized coords, from world->cam poses."""
+    r_rel = img1.rotmat @ img0.rotmat.T
+    t_rel = img1.tvec - r_rel @ img0.tvec
+    tx = np.asarray(
+        [
+            [0.0, -t_rel[2], t_rel[1]],
+            [t_rel[2], 0.0, -t_rel[0]],
+            [-t_rel[1], t_rel[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return tx @ r_rel
+
+
+def epipolar_filter_corrs(
+    corrs: np.ndarray,
+    cam0: ColmapCamera,
+    img0: ColmapImage,
+    cam1: ColmapCamera,
+    img1: ColmapImage,
+    max_error_px: float,
+) -> np.ndarray:
+    """Drop matches that violate the epipolar constraint of the known relative pose."""
+    corrs = np.asarray(corrs, dtype=np.float64).reshape(-1, 4)
+    if corrs.size == 0:
+        return corrs.astype(np.float32, copy=False)
+    n0 = pixels_to_normalized(corrs[:, 0:2], cam0)
+    n1 = pixels_to_normalized(corrs[:, 2:4], cam1)
+    e = essential_matrix(img0, img1)
+    x0 = np.column_stack((n0, np.ones(len(n0))))
+    x1 = np.column_stack((n1, np.ones(len(n1))))
+    ex0 = x0 @ e.T          # each row = E x0_i
+    etx1 = x1 @ e           # each row = E^T x1_i
+    num = np.sum(x1 * ex0, axis=1) ** 2
+    denom = ex0[:, 0] ** 2 + ex0[:, 1] ** 2 + etx1[:, 0] ** 2 + etx1[:, 1] ** 2
+    denom = np.where(denom < 1e-12, 1e-12, denom)
+    err_px = np.sqrt(num / denom) * (0.5 * (camera_focal(cam0) + camera_focal(cam1)))
+    return corrs[err_px <= max_error_px].astype(np.float32, copy=False)
+
+
+def epipolar_filter_pairs(
+    pair_matches: Sequence[PairMatch],
+    cameras_by_id: dict[int, ColmapCamera],
+    images_by_name: dict[str, ColmapImage],
+    max_error_px: float,
+    min_matches: int,
+) -> tuple[list[PairMatch], int, int]:
+    """Epipolar-clean every pair using known poses. Pairs without a known pose pass through."""
+    filtered: list[PairMatch] = []
+    n_in = 0
+    n_out = 0
+    for pm in pair_matches:
+        n_in += len(pm.matches)
+        img0 = images_by_name.get(pm.name0)
+        img1 = images_by_name.get(pm.name1)
+        if img0 is None or img1 is None:
+            filtered.append(pm)
+            n_out += len(pm.matches)
+            continue
+        kept = epipolar_filter_corrs(pm.matches, cameras_by_id[img0.camera_id], img0, cameras_by_id[img1.camera_id], img1, max_error_px)
+        n_out += len(kept)
+        if len(kept) >= min_matches:
+            filtered.append(PairMatch(pm.name0, pm.name1, kept))
+    return filtered, n_in, n_out
+
+
+def run_undistort(colmap: str, image_dir: Path, model_dir: Path, undistort_dir: Path, log_dir: Path, args) -> None:
+    """Write undistorted images + a distortion-free (PINHOLE) model via COLMAP image_undistorter."""
+    if undistort_dir.exists():
+        shutil.rmtree(undistort_dir)
+    undistort_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        colmap,
+        "image_undistorter",
+        "--image_path",
+        str(image_dir),
+        "--input_path",
+        str(model_dir),
+        "--output_path",
+        str(undistort_dir),
+        "--output_type",
+        "COLMAP",
+    ]
+    if args.undistort_max_image_size and args.undistort_max_image_size > 0:
+        cmd += ["--max_image_size", str(args.undistort_max_image_size)]
+    run_command(cmd, log_dir / "image_undistorter.log")
+
+
+@dataclass
+class ExportContext:
+    """Holds the shared 3DGS export targets and the per-camera centering crops.
+
+    In --static_rig the crops + shared sparse model are computed once on the reference
+    frame and reused, so every frame writes images that match one shared camera set.
+    """
+    images_root: Path        # output_root/undistorted/images
+    sparse_dir: Path         # output_root/undistorted/sparse/0
+    crop_by_name: dict[str, tuple[int, int, int, int]] | None = None
+
+
+def center_crop_spec(width: int, height: int, cx: float, cy: float) -> tuple[int, int, int, int]:
+    """Largest centered (left, top, w, h) window whose centre is the principal point."""
+    cxr = int(round(cx))
+    cyr = int(round(cy))
+    hw = max(1, min(cxr, width - cxr))
+    hh = max(1, min(cyr, height - cyr))
+    return cxr - hw, cyr - hh, 2 * hw, 2 * hh
+
+
+def crop_image_file(src: Path, dst: Path, spec: tuple[int, int, int, int]) -> None:
+    import cv2
+
+    img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"failed to read undistorted image: {src}")
+    left, top, w, h = spec
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dst), img[top:top + h, left:left + w])
+
+
+def read_colmap_model_any(colmap: str, model_dir: Path, txt_tmp: Path, log_dir: Path):
+    """Convert a (binary) COLMAP model to text and read it."""
+    if txt_tmp.exists():
+        shutil.rmtree(txt_tmp)
+    txt_tmp.mkdir(parents=True, exist_ok=True)
+    run_command([colmap, "model_converter", "--input_path", str(model_dir), "--output_path", str(txt_tmp), "--output_type", "TXT"], log_dir / "undist_model_converter.log")
+    return read_colmap_text_model(txt_tmp)
+
+
+def write_colmap_text_model(
+    tmp_dir: Path,
+    cameras: dict[int, ColmapCamera],
+    images: dict[int, ColmapImage],
+    points: Sequence[ColmapPoint3D],
+    crops: dict[int, tuple[int, int, int, int]],
+) -> None:
+    """Write cameras/images/points3D .txt, shifting 2D points by each camera's crop."""
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    cam_lines = ["# Camera list"]
+    for cid in sorted(cameras):
+        cam = cameras[cid]
+        params = " ".join(repr(float(x)) for x in cam.params)
+        cam_lines.append(f"{cid} {cam.model} {int(cam.width)} {int(cam.height)} {params}")
+    (tmp_dir / "cameras.txt").write_text("\n".join(cam_lines) + "\n", encoding="utf-8")
+
+    img_lines = ["# Image list with two lines of data per image"]
+    for iid in sorted(images):
+        im = images[iid]
+        left, top = crops[im.camera_id][0], crops[im.camera_id][1]
+        q = " ".join(repr(float(x)) for x in im.qvec)
+        t = " ".join(repr(float(x)) for x in im.tvec)
+        img_lines.append(f"{iid} {q} {t} {im.camera_id} {im.name}")
+        toks = [
+            f"{float(x) - left!r} {float(y) - top!r} {int(pid)}"
+            for (x, y), pid in zip(im.xys, im.point3d_ids)
+        ]
+        img_lines.append(" ".join(toks))
+    (tmp_dir / "images.txt").write_text("\n".join(img_lines) + "\n", encoding="utf-8")
+
+    pt_lines = ["# 3D point list"]
+    for pt in points:
+        track = " ".join(f"{iid} {pidx}" for iid, pidx in pt.track)
+        pt_lines.append(
+            f"{pt.point_id} {float(pt.xyz[0])!r} {float(pt.xyz[1])!r} {float(pt.xyz[2])!r} "
+            f"{int(pt.rgb[0])} {int(pt.rgb[1])} {int(pt.rgb[2])} {float(pt.error)!r} {track}".rstrip()
+        )
+    (tmp_dir / "points3D.txt").write_text("\n".join(pt_lines) + "\n", encoding="utf-8")
+
+
+def write_shared_undistorted_model(
+    colmap: str,
+    out_dir: Path,
+    cameras: dict[int, ColmapCamera],
+    images: dict[int, ColmapImage],
+    points: Sequence[ColmapPoint3D],
+    crops: dict[int, tuple[int, int, int, int]],
+    tmp_dir: Path,
+    log_dir: Path,
+) -> None:
+    """Write the shared centered-PINHOLE model as .bin (3DGS reads camera/pose/points3D)."""
+    write_colmap_text_model(tmp_dir, cameras, images, points, crops)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_command([colmap, "model_converter", "--input_path", str(tmp_dir), "--output_path", str(out_dir), "--output_type", "BIN"], log_dir / "shared_model_converter.log")
+
+
+def undistort_and_export(colmap: str, paths: FramePaths, args, model_dir: Path, export_ctx: ExportContext) -> None:
+    """Undistort + re-center-crop a frame's images into the shared 3DGS layout.
+
+    The first call (reference frame) also computes the per-camera centering crops and
+    writes the shared centered-PINHOLE sparse model; later calls reuse the crops.
+    """
+    undist_dir = paths.frame_out / "undist"
+    run_undistort(colmap, paths.image_dir, model_dir, undist_dir, paths.log_dir, args)
+    src_dir = undist_dir / "images"
+
+    if export_ctx.crop_by_name is None:
+        ucams, uimgs, upoints = read_colmap_model_any(colmap, undist_dir / "sparse", paths.frame_out / "undist_txt", paths.log_dir)
+        crop_by_cam: dict[int, tuple[int, int, int, int]] = {}
+        recentered: dict[int, ColmapCamera] = {}
+        for cid, cam in ucams.items():
+            fx, fy, cx, cy = float(cam.params[0]), float(cam.params[1]), float(cam.params[2]), float(cam.params[3])
+            spec = center_crop_spec(cam.width, cam.height, cx, cy)
+            crop_by_cam[cid] = spec
+            _, _, w, h = spec
+            recentered[cid] = ColmapCamera(cid, "PINHOLE", w, h, np.asarray([fx, fy, w / 2.0, h / 2.0], dtype=np.float64))
+        export_ctx.crop_by_name = {im.name: crop_by_cam[im.camera_id] for im in uimgs.values()}
+        write_shared_undistorted_model(colmap, export_ctx.sparse_dir, recentered, uimgs, upoints, crop_by_cam, paths.frame_out / "shared_txt", paths.log_dir)
+        LOGGER.info("export: wrote shared undistorted model -> %s", export_ctx.sparse_dir)
+
+    out_img_dir = export_ctx.images_root / paths.output_name
+    if out_img_dir.exists():
+        shutil.rmtree(out_img_dir)
+    cropped = 0
+    for src in sorted(src_dir.iterdir()):
+        spec = export_ctx.crop_by_name.get(src.name)
+        if spec is None:
+            continue
+        crop_image_file(src, out_img_dir / src.name, spec)
+        cropped += 1
+    LOGGER.info("export: %s -> %d undistorted+centered images", paths.output_name, cropped)
 
 
 @dataclass(frozen=True)
@@ -1178,8 +1616,8 @@ class FramePaths:
     dense_ply: Path
 
 
-def make_frame_paths(frame_index: int, args) -> FramePaths:
-    output_name = f"frame_{frame_index:06d}"
+def make_frame_paths(frame_name: str, args) -> FramePaths:
+    output_name = frame_name
     frame_out = args.output_root / "_workspace" / output_name
     return FramePaths(
         output_name=output_name,
@@ -1189,7 +1627,7 @@ def make_frame_paths(frame_index: int, args) -> FramePaths:
         database_path=frame_out / "database.db",
         sparse_dir=frame_out / "sparse",
         model_txt_dir=frame_out / "model_txt",
-        output_ply=args.output_root / "points_cloud" / f"{output_name}.ply",
+        output_ply=args.output_root / "points" / f"{output_name}.ply",
         dense_dir=frame_out / "dense",
         dense_ply=args.output_root / "dense_points_cloud" / f"{output_name}.ply",
     )
@@ -1223,6 +1661,8 @@ def make_matcher(args) -> SuperGlueMatcher:
         sinkhorn_iterations=args.sinkhorn_iterations,
         match_threshold=args.match_threshold,
         device=args.device,
+        fp16=args.fp16,
+        tf32=args.tf32,
     )
 
 
@@ -1232,11 +1672,35 @@ def match_frame_pairs(
     matcher: SuperGlueMatcher,
     args,
     output_name: str,
+    pairs: Sequence[tuple[str, str]] | None = None,
+    resize: Sequence[int] | None = None,
 ) -> tuple[list[PairMatch], dict]:
-    pairs = build_pairs(image_names, args.pair_mode, args.pair_window, args.loop_pairs, args.pairs_file)
+    if pairs is None:
+        pairs = build_pairs(image_names, args.pair_mode, args.pair_window, args.loop_pairs, args.pairs_file)
     if args.max_pairs:
         pairs = pairs[: args.max_pairs]
     LOGGER.info("%s: %d image pairs", output_name, len(pairs))
+
+    # Detect SuperPoint features once per image, then reuse across all of its pairs.
+    # Image decode (CPU/disk) is prefetched on worker threads so it overlaps the GPU
+    # SuperPoint pass; only the GPU encode runs on this (CUDA) thread.
+    used_names = sorted({n for pair in pairs for n in pair}, key=natural_key)
+    feats: dict[str, dict] = {}
+    workers = max(1, int(getattr(args, "decode_workers", 4)))
+    if workers > 1 and len(used_names) > 1:
+        prefetch = max(workers, 2)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending: dict = {}
+            next_idx = 0
+            for done_idx, name in enumerate(used_names):
+                while next_idx < len(used_names) and len(pending) < prefetch:
+                    n = used_names[next_idx]
+                    pending[n] = pool.submit(matcher._decode, image_infos[n].path, resize)
+                    next_idx += 1
+                feats[name] = matcher._encode(pending.pop(name).result())
+    else:
+        for name in used_names:
+            feats[name] = matcher.detect(image_infos[name].path, resize)
 
     pair_matches: list[PairMatch] = []
     raw_total = 0
@@ -1245,7 +1709,7 @@ def match_frame_pairs(
     for idx, (name0, name1) in enumerate(pairs, start=1):
         if idx == 1 or idx % args.log_every == 0:
             LOGGER.info("%s: matching pair %d/%d (%s, %s)", output_name, idx, len(pairs), name0, name1)
-        raw = matcher.match_pair(image_infos[name0].path, image_infos[name1].path)
+        raw = matcher.match_cached(feats[name0], feats[name1])
         raw_total += len(raw)
         kept = filter_corrs(raw, image_infos[name0], image_infos[name1], args.min_matches, args.ransac, args.ransac_max_error, args.ransac_confidence)
         kept_total += len(kept)
@@ -1272,7 +1736,8 @@ def finalize_frame(
     colmap: str,
     extra_stats: dict,
     num_images: int,
-) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage]]:
+    export_ctx: ExportContext | None = None,
+) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage], list[ColmapPoint3D]]:
     export_model_txt(colmap, model_dir, paths.model_txt_dir, paths.log_dir)
     cameras, images, points = read_colmap_text_model(paths.model_txt_dir)
     raw_num_points = len(points)
@@ -1287,8 +1752,15 @@ def finalize_frame(
         if not flow_dir.exists():
             flow_dir = args.flows_root
         velocity_result = estimate_flow_velocity_for_points(points, cameras, images, flow_dir, args)
-    write_points_ply(paths.output_ply, points, velocity_result)
-    final_model_dir = copy_sparse_model(model_dir, args.output_root, paths.output_name, args.force)
+    write_points_ply(paths.output_ply, points, velocity_result, ascii=args.ply_ascii)
+
+    if args.undistort:
+        # In --static_rig export_ctx is shared (one camera set); otherwise make a per-frame one.
+        ctx = export_ctx if export_ctx is not None else ExportContext(
+            images_root=args.output_root / "undistorted" / "images",
+            sparse_dir=args.output_root / "undistorted" / "sparse" / paths.output_name / "0",
+        )
+        undistort_and_export(colmap, paths, args, model_dir, ctx)
 
     if args.dense:
         paths.dense_ply.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,7 +1769,6 @@ def finalize_frame(
     stats = {
         "frame": frame_dir.name,
         "output_name": paths.output_name,
-        "sparse_model_dir": str(final_model_dir),
         "sparse_ply": str(paths.output_ply),
         "dense_ply": str(paths.dense_ply) if args.dense else None,
         "num_images": num_images,
@@ -1315,17 +1786,18 @@ def finalize_frame(
             paths.frame_out.parent.rmdir()
         except OSError:
             pass
-    return stats, cameras, images
+    return stats, cameras, images, points
 
 
 def reconstruct_frame(
     frame_dir: Path,
-    frame_index: int,
+    frame_name: str,
     args,
     colmap: str,
     matcher: SuperGlueMatcher,
-) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage]]:
-    paths = make_frame_paths(frame_index, args)
+    export_ctx: ExportContext | None = None,
+) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage], list[ColmapPoint3D]]:
+    paths = make_frame_paths(frame_name, args)
     prepare_frame_workspace(paths, args)
 
     src_images = list_images(frame_dir, args.max_images)
@@ -1344,8 +1816,24 @@ def reconstruct_frame(
     LOGGER.info("%s: exported %s", paths.output_name, db_stats)
 
     model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args)
-    extra_stats = {**match_stats, "database_export": db_stats, "mode": "incremental_sfm"}
-    return finalize_frame(model_dir, paths, frame_dir, args, colmap, extra_stats, len(staged_images))
+    mode = "incremental_sfm"
+
+    if args.epipolar_filter:
+        export_model_txt(colmap, model_dir, paths.model_txt_dir, paths.log_dir)
+        cameras, images, _ = read_colmap_text_model(paths.model_txt_dir)
+        images_by_name = {img.name: img for img in images.values()}
+        refined, n_in, n_out = epipolar_filter_pairs(pair_matches, cameras, images_by_name, args.epipolar_max_error, args.min_matches)
+        if len(refined) >= 2 and n_out < n_in:
+            LOGGER.info("%s: epipolar refine kept %d/%d matches; re-solving poses", paths.output_name, n_out, n_in)
+            db_stats = export_matches_to_database(paths.database_path, image_infos, refined, args.keypoint_quantization, args.two_view_config)
+            model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args)
+            mode = "incremental_sfm_epipolar_refined"
+            match_stats = {**match_stats, "epipolar_matches_in": n_in, "epipolar_matches_kept": n_out}
+        else:
+            LOGGER.info("%s: epipolar refine skipped (kept %d/%d matches, %d pairs)", paths.output_name, n_out, n_in, len(refined))
+
+    extra_stats = {**match_stats, "database_export": db_stats, "mode": mode}
+    return finalize_frame(model_dir, paths, frame_dir, args, colmap, extra_stats, len(staged_images), export_ctx)
 
 
 def create_rig_database(
@@ -1427,7 +1915,7 @@ def run_point_triangulator(
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
+    base_cmd = [
         colmap,
         "point_triangulator",
         "--database_path",
@@ -1449,22 +1937,46 @@ def run_point_triangulator(
         "--Mapper.min_num_matches",
         str(args.mapper_min_num_matches),
     ]
-    run_command(cmd, log_dir / "point_triangulator.log")
+    # Keep every camera pose exactly equal to the shared reference solve.
+    cmd = base_cmd + (["--Mapper.fix_existing_images", "1"] if args.rig_fix_poses else [])
+    try:
+        run_command(cmd, log_dir / "point_triangulator.log")
+    except CommandError:
+        if not args.rig_fix_poses:
+            raise
+        LOGGER.warning(
+            "point_triangulator failed with --Mapper.fix_existing_images (COLMAP may be < 3.7); "
+            "retrying without it. Poses may drift sub-pixel between frames."
+        )
+        run_command(base_cmd, log_dir / "point_triangulator.log")
     if not (output_dir / "points3D.bin").exists() and not (output_dir / "points3D.txt").exists():
         raise RuntimeError(f"point_triangulator produced no model in {output_dir}")
     return output_dir
 
 
-def triangulate_frame_with_rig(
+@dataclass
+class RigMatchResult:
+    """Output of the GPU matching stage, consumed by the CPU triangulation stage."""
+    frame_dir: Path
+    paths: "FramePaths"
+    image_infos: dict
+    pair_matches: list
+    match_stats: dict
+
+
+def rig_match_stage(
     frame_dir: Path,
-    frame_index: int,
+    frame_name: str,
     args,
     colmap: str,
     matcher: SuperGlueMatcher,
     ref_cameras: dict[int, ColmapCamera],
     ref_pose_by_name: dict[str, RigPose],
-) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage]]:
-    paths = make_frame_paths(frame_index, args)
+    ref_images_by_name: dict[str, ColmapImage],
+    fixed_pairs: Sequence[tuple[str, str]] | None = None,
+) -> RigMatchResult:
+    """GPU-bound part: stage images, build the rig database, match + epipolar-filter."""
+    paths = make_frame_paths(frame_name, args)
     prepare_frame_workspace(paths, args)
 
     src_images = list_images(frame_dir, args.max_images)
@@ -1477,18 +1989,67 @@ def triangulate_frame_with_rig(
     LOGGER.info("%s: %d rig cameras with known pose", paths.output_name, len(image_infos))
 
     image_names = [p.name for p in staged_images if p.name in image_infos]
-    pair_matches, match_stats = match_frame_pairs(image_names, image_infos, matcher, args, paths.output_name)
+    pairs = None
+    if fixed_pairs is not None:
+        pairs = [(a, b) for a, b in fixed_pairs if a in image_infos and b in image_infos]
+        if not pairs:
+            raise RuntimeError(f"{paths.output_name}: no rig pairs available for this frame")
+    rig_resize = args.resize if args.rig_resize is None else args.rig_resize
+    pair_matches, match_stats = match_frame_pairs(image_names, image_infos, matcher, args, paths.output_name, pairs=pairs, resize=rig_resize)
     if not pair_matches:
         raise RuntimeError(f"{paths.output_name}: SuperGlue produced no valid pairs")
 
-    db_stats = export_matches_to_database(paths.database_path, image_infos, pair_matches, args.keypoint_quantization, args.two_view_config)
+    if args.epipolar_filter:
+        pair_matches, n_in, n_out = epipolar_filter_pairs(pair_matches, ref_cameras, ref_images_by_name, args.epipolar_max_error, args.min_matches)
+        LOGGER.info("%s: epipolar filter kept %d/%d matches", paths.output_name, n_out, n_in)
+        if not pair_matches:
+            raise RuntimeError(f"{paths.output_name}: no matches survived epipolar filtering")
+        match_stats = {**match_stats, "epipolar_matches_in": n_in, "epipolar_matches_kept": n_out}
+
+    return RigMatchResult(frame_dir, paths, image_infos, pair_matches, match_stats)
+
+
+def rig_solve_stage(
+    match: RigMatchResult,
+    args,
+    colmap: str,
+    ref_cameras: dict[int, ColmapCamera],
+    ref_pose_by_name: dict[str, RigPose],
+    export_ctx: ExportContext | None = None,
+) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage], list[ColmapPoint3D]]:
+    """CPU/disk-bound part: DB export, point_triangulator, filter + undistort export.
+
+    No GPU and no shared mutable state with other frames, so it can run on a worker
+    thread while the next frame is matched on the GPU."""
+    paths = match.paths
+    image_infos = match.image_infos
+    db_stats = export_matches_to_database(paths.database_path, image_infos, match.pair_matches, args.keypoint_quantization, args.two_view_config)
     LOGGER.info("%s: exported %s", paths.output_name, db_stats)
 
     skeleton_dir = paths.frame_out / "rig_input"
     write_skeleton_model(skeleton_dir, image_infos, ref_cameras, ref_pose_by_name)
     model_dir = run_point_triangulator(colmap, paths.database_path, paths.image_dir, skeleton_dir, paths.sparse_dir / "0", paths.log_dir, args)
-    extra_stats = {**match_stats, "database_export": db_stats, "mode": "rig_triangulation"}
-    return finalize_frame(model_dir, paths, frame_dir, args, colmap, extra_stats, len(image_infos))
+    extra_stats = {**match.match_stats, "database_export": db_stats, "mode": "rig_triangulation"}
+    return finalize_frame(model_dir, paths, match.frame_dir, args, colmap, extra_stats, len(image_infos), export_ctx)
+
+
+def triangulate_frame_with_rig(
+    frame_dir: Path,
+    frame_name: str,
+    args,
+    colmap: str,
+    matcher: SuperGlueMatcher,
+    ref_cameras: dict[int, ColmapCamera],
+    ref_pose_by_name: dict[str, RigPose],
+    ref_images_by_name: dict[str, ColmapImage],
+    fixed_pairs: Sequence[tuple[str, str]] | None = None,
+    export_ctx: ExportContext | None = None,
+) -> tuple[dict, dict[int, ColmapCamera], dict[int, ColmapImage], list[ColmapPoint3D]]:
+    match = rig_match_stage(
+        frame_dir, frame_name, args, colmap, matcher,
+        ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs,
+    )
+    return rig_solve_stage(match, args, colmap, ref_cameras, ref_pose_by_name, export_ctx)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1509,6 +2070,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rig_ref_frame", type=str, default=None,
                         help="Frame folder name used for the reference pose solve in --static_rig "
                              "(default: first selected frame).")
+    parser.add_argument("--rig_fix_poses", action=argparse.BooleanOptionalAction, default=True,
+                        help="In --static_rig, freeze every camera pose to the shared reference solve "
+                             "(point_triangulator --Mapper.fix_existing_images). Needs COLMAP >= 3.7.")
+    parser.add_argument("--rig_pair_mode", choices=["covisibility", "same"], default="covisibility",
+                        help="How non-reference frames pick image pairs in --static_rig. 'covisibility' reuses a "
+                             "pose-guided pair set computed once from the reference (much faster); 'same' re-uses "
+                             "--pair_mode for every frame.")
+    parser.add_argument("--rig_covis_top_k", type=int, default=12,
+                        help="Per camera, keep this many most-covisible neighbours for the rig pair set.")
+    parser.add_argument("--rig_covis_min_shared", type=int, default=20,
+                        help="Minimum shared reference 3D points for a covisibility pair to count.")
+    parser.add_argument("--rig_geo_neighbors", type=int, default=6,
+                        help="Per camera, also add this many nearest neighbours by viewing angle (robust to motion).")
+    parser.add_argument("--rig_resize", type=int, nargs="+", default=[2560],
+                        help="Resize for non-reference frames in --static_rig (poses are fixed, so a lower value is "
+                             "faster). Use -1 for full resolution. The reference frame always uses --resize.")
+
+    parser.add_argument("--epipolar_filter", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the estimated poses to epipolar-clean matches: the reference frame re-solves "
+                             "once with cleaned matches (updates intrinsics/extrinsics), and every frame's matches "
+                             "are filtered before triangulation.")
+    parser.add_argument("--epipolar_max_error", type=float, default=1.5,
+                        help="Max epipolar (Sampson) distance in pixels for --epipolar_filter.")
+
+    parser.add_argument("--undistort", action=argparse.BooleanOptionalAction, default=True,
+                        help="Also write undistorted images + a distortion-free model under output/undistorted/.")
+    parser.add_argument("--undistort_max_image_size", type=int, default=0,
+                        help="Cap the long side of undistorted images (0 = keep full resolution).")
 
     parser.add_argument("--colmap", default="colmap")
     parser.add_argument("--camera_model", choices=sorted(CAMERA_MODEL_IDS), default="OPENCV")
@@ -1529,6 +2118,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sinkhorn_iterations", type=int, default=20)
     parser.add_argument("--match_threshold", type=float, default=0.2)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+
+    # --- Hardware-utilisation / speed knobs (no algorithmic change) ---
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run SuperPoint+SuperGlue in fp16 mixed precision on CUDA (~1.5-2x). "
+                             "Keypoint coordinates stay fp32; matches differ only negligibly. "
+                             "Use --no-fp16 for bit-identical full-precision matching.")
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
+                        help="Allow TF32 matmul/conv on Ampere+ (small speedup, tiny numeric change).")
+    parser.add_argument("--pipeline", action=argparse.BooleanOptionalAction, default=True,
+                        help="In --static_rig, overlap each frame's CPU triangulation/export with the "
+                             "next frame's GPU matching. Frames are independent, so output is unchanged.")
+    parser.add_argument("--decode_workers", type=int, default=4,
+                        help="Threads that pre-decode images so disk/CPU decode overlaps GPU detection "
+                             "(1 disables prefetch).")
 
     parser.add_argument("--compute_velocity", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--flows_root", type=Path, default=Path("data/twopeople/flows"))
@@ -1551,6 +2154,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Drop sparse points seen by fewer than this many images (0 disables).")
     parser.add_argument("--ply_max_reproj_error", type=float, default=2.0,
                         help="Drop sparse points whose reprojection error exceeds this (0 disables).")
+    parser.add_argument("--ply_ascii", action=argparse.BooleanOptionalAction, default=True,
+                        help="Write point clouds as text/ASCII PLY (openable in a text editor). "
+                             "Use --no-ply_ascii for compact binary PLY.")
 
     parser.add_argument("--ba_refine_focal_length", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ba_refine_principal_point", action=argparse.BooleanOptionalAction, default=True)
@@ -1593,7 +2199,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOGGER.info("selected frames: %s", ", ".join(p.name for p in selected_frames))
     matcher = make_matcher(args)
     all_stats = []
-    name_to_index = {p.name: idx + 1 for idx, p in enumerate(frame_dirs)}
 
     if args.static_rig:
         by_name = {p.name: p for p in frame_dirs}
@@ -1601,31 +2206,70 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ref_name not in by_name:
             raise ValueError(f"--rig_ref_frame '{ref_name}' not found among frame folders")
         ref_frame = by_name[ref_name]
+        export_ctx = ExportContext(
+            images_root=args.output_root / "undistorted" / "images",
+            sparse_dir=args.output_root / "undistorted" / "sparse" / "0",
+        ) if args.undistort else None
         LOGGER.info("static rig: solving reference poses from frame '%s'", ref_name)
-        ref_stats, ref_cameras, ref_images = reconstruct_frame(ref_frame, name_to_index[ref_name], args, colmap, matcher)
+        ref_stats, ref_cameras, ref_images, ref_points = reconstruct_frame(ref_frame, ref_name, args, colmap, matcher, export_ctx)
         all_stats.append(ref_stats)
         ref_pose_by_name = {
             img.name: RigPose(img.image_id, img.qvec, img.tvec, img.camera_id)
             for img in ref_images.values()
         }
+        ref_images_by_name = {img.name: img for img in ref_images.values()}
         LOGGER.info("static rig: reference registered %d/%d cameras", len(ref_pose_by_name), ref_stats["num_images"])
-        for frame_dir in selected_frames:
-            if frame_dir.name == ref_name:
-                continue
-            stats, _, _ = triangulate_frame_with_rig(
-                frame_dir, name_to_index[frame_dir.name], args, colmap, matcher, ref_cameras, ref_pose_by_name
+
+        fixed_pairs = None
+        if args.rig_pair_mode == "covisibility":
+            ref_names = sorted(ref_pose_by_name, key=natural_key)
+            fixed_pairs = build_rig_pairs(
+                ref_images, ref_points, ref_names,
+                args.rig_covis_top_k, args.rig_covis_min_shared, args.rig_geo_neighbors,
             )
-            all_stats.append(stats)
+            full = len(ref_names) * (len(ref_names) - 1) // 2
+            LOGGER.info("static rig: pose-guided pair set = %d pairs (exhaustive would be %d)", len(fixed_pairs), full)
+            if not fixed_pairs:
+                LOGGER.warning("static rig: covisibility pair set empty; falling back to per-frame --pair_mode")
+                fixed_pairs = None
+
+        rig_frames = [f for f in selected_frames if f.name != ref_name]
+        if args.pipeline and len(rig_frames) > 1:
+            # Overlap frame N's CPU triangulation/export with frame N+1's GPU matching.
+            # Frames are independent (shared fixed poses), so the output is unchanged.
+            with ThreadPoolExecutor(max_workers=1) as solver:
+                pending = None
+                for frame_dir in rig_frames:
+                    match = rig_match_stage(
+                        frame_dir, frame_dir.name, args, colmap, matcher,
+                        ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs,
+                    )
+                    if pending is not None:
+                        all_stats.append(pending.result()[0])
+                    pending = solver.submit(
+                        rig_solve_stage, match, args, colmap, ref_cameras, ref_pose_by_name, export_ctx,
+                    )
+                if pending is not None:
+                    all_stats.append(pending.result()[0])
+        else:
+            for frame_dir in rig_frames:
+                stats, _, _, _ = triangulate_frame_with_rig(
+                    frame_dir, frame_dir.name, args, colmap, matcher, ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs, export_ctx
+                )
+                all_stats.append(stats)
     else:
         for frame_dir in selected_frames:
-            stats, _, _ = reconstruct_frame(frame_dir, name_to_index[frame_dir.name], args, colmap, matcher)
+            stats, _, _, _ = reconstruct_frame(frame_dir, frame_dir.name, args, colmap, matcher)
             all_stats.append(stats)
 
+    if args.undistort:
+        LOGGER.info("3DGS export: images=%s  shared sparse=%s",
+                    args.output_root / "undistorted" / "images",
+                    args.output_root / "undistorted" / "sparse" / "0")
     for stats in all_stats:
         LOGGER.info(
-            "%s: sparse=%s ply=%s velocity=%d/%d",
+            "%s: ply=%s velocity=%d/%d",
             stats["output_name"],
-            stats["sparse_model_dir"],
             stats["sparse_ply"],
             stats["velocity_valid_points"],
             stats["num_sparse_points"],
