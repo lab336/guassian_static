@@ -18,15 +18,9 @@ data/twopeople/images/1/2.png      # 帧 1，相机 2
 data/twopeople/images/2/1.png      # 帧 2，相机 1
 ```
 
-光流目录（文件名和相机编号一致，`.npy` 形状为 `(H, W, 2)`）：
+> 光流**不再需要你预先准备**——默认（`--compute_flow`）脚本会用 WAFT 自动生成到 `output_root/flows/`（见第 4 节「一条命令跑通」）。只有在 `--no-compute_flow` 的旧模式下才需要外部光流目录 `--flows_root`（`.npy` 形状 `(H,W,2)`）。
 
-```text
-data/twopeople/flows/1/1.npy
-data/twopeople/flows/1/2.npy
-data/twopeople/flows/2/1.npy
-```
-
-`--images_root`、`--flows_root`、`--output_root` 都有默认值（分别指向上面这些路径和 `output/twopeople_superglue`），**只要在仓库根目录运行脚本，就不用手动写这三个路径**。
+`--images_root`、`--output_root` 都有默认值，**只要在仓库根目录运行脚本，就基本不用手动写路径**。
 
 ---
 
@@ -93,12 +87,17 @@ output/twopeople1/
         cameras.bin images.bin points3D.bin
   points/
     1.ply 2.ply ...      # 每帧稀疏点云（带速度属性）
+  flows/
+    1/                   # 帧 1→2 的前向光流（逐相机）
+      1.npy 2.npy ...    # 与 undistorted/images/1/1.png 等逐像素对齐
+    2/                   # 帧 2→3 ...
 ```
 
 关键点：
 - **`undistorted/sparse/0/` 是所有帧共用的一组内外参**（静态机位），相机模型是 PINHOLE 且**主点已居中**（cx=W/2、cy=H/2），所以原版 3DGS 不会再因为忽略 cx/cy 而发糊。
 - **`undistorted/images/<帧>/`** 是对应的去畸变+居中裁剪图像。同一台相机在所有帧里尺寸一致；不同相机尺寸可以不同（都已在 `cameras.bin` 里各自记好）。
-- **`points/<帧>.ply`** 是每帧点云（带 `vx vy vz` 等速度属性，**仅供你自己的 4D 流程用**；不要拿它当 3DGS 的 input.ply，3DGS 用 `sparse/0/points3D.bin` 初始化）。
+- **`flows/<N>/<相机>.npy`** 是 WAFT 在去畸变图上算的前向光流 `N→N+1`，`(H,W,2)` 原始像素位移，**与 `undistorted/images/<N>/<相机>.png` 逐像素对齐**，直接用作 4DGS 监督。最后一帧无前向流。
+- **`points/<帧>.ply`** 是每帧点云（带 `vx vy vz` 速度属性，**仅供你自己的 4D 流程用**；不要拿它当 3DGS 的 input.ply，3DGS 用 `sparse/0/points3D.bin` 初始化）。
 
 输出帧名与输入帧文件夹名一致：输入 `images/1` → `images/1/`、`points/1.ply`。
 
@@ -118,6 +117,40 @@ velocity_views         # 参与速度三角化的相机数
 ```
 
 > `.ply` **默认是 ASCII（文本）格式**，可直接用记事本/编辑器打开查看，CloudCompare、Open3D、3DGS 也都能读。想要更小、读写更快的二进制 PLY 就加 `--no-ply_ascii`（稀疏点云体积差别很小）。
+
+### 一条命令跑通 SuperGlue + COLMAP + WAFT（默认开启）
+
+现在**只输入图片**即可，脚本会自动把三件事串起来，输出 `undistorted/`、`points/`、`flows/`：
+
+```powershell
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1:201 --static_rig --force `
+  --images_root .\data\two\images\ --output_root .\output\twopeople --resize -1
+```
+
+> ⚠️ **一定要加 `--no-capture-output`**（或先 `conda activate gsstatic` 再直接 `python ...`）。否则 `conda run` 会**缓冲子进程的输出**，进度条和日志都不会实时显示——会让你误以为卡住了。
+
+流程分三阶段（都在一个进程里）：
+1. **重建 + 去畸变**：SuperGlue+COLMAP 解算每帧位姿/内参/稀疏点 → 去畸变+主点居中 → `undistorted/images/<帧>/<相机>.png` + 共享 `undistorted/sparse/0`。
+2. **WAFT 光流**：重建完成后释放 SuperGlue 显存、加载 WAFT，对**去畸变图**逐相机做相邻帧前向光流 `N→N+1`，写 `flows/<N>/<相机>.npy`。**flow 与 `undistorted/images/<N>/<相机>.png` 逐像素对齐**（原生分辨率），可直接做 4DGS 监督。
+3. **速度**：在**去畸变 PINHOLE 空间**用刚生成的 flow 给每个 3D 点算 `vx/vy/vz`，写进 `points/<N>.ply`。最后一帧无前向流 → 速度为 0。
+
+> **关于 WAFT 分辨率**：WAFT **不是只能输出 1600×900**——它输出分辨率 = 输入分辨率（内部按 32 的倍数 padding 再裁回）。之前的 1600×900 只是因为喂了 1600×900 的图。这里默认在**去畸变原生分辨率**上跑（与图 1:1）。若显存不够，用 `--flow_max_size 2560` 限制长边（flow 存为该尺寸，按比例对齐）。
+
+关键参数（一般不用动）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--compute_flow` | 开 | 跑集成的 WAFT 阶段并输出 `flows/`。关掉用 `--no-compute_flow`（退回旧的「外部光流」模式，用 `--flows_root`）。 |
+| `--waft_root` | `f:/project/WAFT` | WAFT 仓库路径（进程内导入，需在 `gsstatic` 环境）。 |
+| `--waft_ckpt` | `ckpts/a2/waftv2-ckpts/twins/zero-shot.pth` | WAFT 权重（相对 `--waft_root`）。`--waft_cfg` 同理。 |
+| `--flow_max_size` | 0（原生） | 限制喂给 WAFT 的长边以省显存；0 = 去畸变原生分辨率。 |
+| `--flow_direction` | forward | 速度按前向 `N→N+1` 解释。若另有反向流可用 `backward` 取反。 |
+| `--velocity_dt` | 1.0 | 帧间隔。若改用更大时间基线（`N→N+k`）让运动更明显，把它设为 `k`。 |
+| `--skip_existing_flow` | 关 | 断点续跑时跳过已存在的 `.npy`。 |
+
+> 跑完看日志自检：`flow: a->b wrote N/M cameras`、`velocity(undist): N/M points passed`、`velocity(undist): median applied flow displacement = X px`（应是亚像素~几像素，不该是上千）。位移 >10% 图宽会告警。
+>
+> **提升速度信号**：若逐帧运动是亚像素（信号弱），用更大时间基线 `N→N+k` 配 `--velocity_dt k`；或保持原生分辨率（默认）以保留细节。
 
 ---
 
@@ -174,7 +207,9 @@ velocity_views         # 参与速度三角化的相机数
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--pipeline` | 开 | `--static_rig` 下，把第 N 帧的三角化+去畸变导出（CPU/磁盘）和第 N+1 帧的匹配（GPU）**重叠**起来。各帧相互独立，输出完全一致。墙钟时间常能接近砍半。想串行排错用 `--no-pipeline`。 |
+| `--pipeline` | 开 | `--static_rig` 下，把每帧的 CPU/磁盘 solve（三角化+去畸变+裁剪）和后续帧的 GPU 匹配**重叠**起来。各帧相互独立，输出完全一致。想串行排错用 `--no-pipeline`。 |
+| `--solver_workers` | 0=自动 | 流水线里同时跑几个帧的 solve（去畸变+裁剪是磁盘密集型，所以默认按核数取 2 个，避免磁盘抖动）。GPU 会一直往前匹配、不再傻等单个 solve。点云/图像不变。 |
+| `--export_workers` | 0=自动 | 每帧去畸变图裁剪/写盘的线程数（cv2，释放 GIL→真多核）。默认按核数取（≤8）。这是之前 GPU 空闲、CPU 也不高的那段「串行裁剪 100×4K」的提速点。 |
 | `--decode_workers 4` | 4 | 后台预解码图片的线程数，让磁盘/CPU 的 4K 解码和 GPU 检测重叠。输出不变。机器核多可调大；设 `1` 关闭预取。 |
 | `--fp16` | 开 | SuperPoint+SuperGlue 用 fp16 混合精度（Ampere/Ada 上约 1.5~2×）。**关键点坐标仍保持 fp32**，匹配点集只有极微差异（后面有 RANSAC + 对极清洗兜底）。要逐位一致的全精度匹配用 `--no-fp16`。 |
 | `--tf32` | 开 | 允许 Ampere+ 上的 TF32 矩阵/卷积（小幅加速，数值差异比 fp16 更小）。要绝对精确用 `--no-tf32`。 |
@@ -195,6 +230,7 @@ velocity_views         # 参与速度三角化的相机数
 | 参数 | 说明 |
 | --- | --- |
 | `--no-compute_velocity` | 不估计速度，只输出点云（更快）。 |
+| `--progress` / `--no-progress` | 进度条（默认开）：显示帧进度+预计剩余时间、单帧匹配对进度、光流进度。重定向到文件时可用 `--no-progress` 回到纯日志。 |
 | `--keep_workspace` | 保留临时图片、database、日志和 TXT 模型，排错时用。 |
 | `--single_camera` | 所有相机共用一套内参。本数据集是 100 路**不同**相机，**不要**加。 |
 
@@ -234,16 +270,16 @@ conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1:3 --static_ri
 conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1:3 --static_rig --rig_pair_mode same --force
 ```
 
-**速度有效点太少**：放宽速度门槛。
+**速度有效点太少**：先看日志的 `velocity: median applied flow displacement` 和 `velocity drops`。若位移是上千像素并有告警 → 是光流格式/空间用错（见上面「WAFT 光流接入」，WAFT 用 `--flow_format pixel`、在**原图**上跑）。确认无误后再放宽门槛：
 
 ```powershell
 conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1 --static_rig --velocity_min_views 2 --velocity_max_reproj_error 6.0 --force
 ```
 
-**速度数值明显偏大 / 偏小**：优先换光流格式（`norm` / `midnorm` / `pixel`）。
+**速度方向反了**（位移合理但 vx/vy/vz 符号不对）：你的光流是反向（N+1→N）。加 `--flow_direction backward`：
 
 ```powershell
-conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1 --static_rig --flow_format pixel --force
+conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1 --static_rig --flow_direction backward --force
 ```
 
 **想看中间文件排错**：

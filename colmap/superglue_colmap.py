@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
+from collections import deque
 import json
 import logging
 import os
@@ -121,12 +122,76 @@ def natural_key(path_or_name: Path | str) -> tuple:
     return (1, parts, name)
 
 
-def setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+class _TqdmLoggingHandler(logging.Handler):
+    """Emit log records via tqdm.write so live progress bars are not shredded."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from tqdm import tqdm
+
+            tqdm.write(self.format(record))
+        except Exception:
+            try:
+                print(self.format(record))
+            except Exception:
+                self.handleError(record)
+
+
+class _NullBar:
+    """No-op stand-in for tqdm when progress is disabled or tqdm is missing."""
+
+    def update(self, n: int = 1) -> None:
+        pass
+
+    def set_postfix_str(self, *a, **k) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        pass
+
+
+def make_pbar(total: int | None, desc: str, unit: str, enable: bool, leave: bool = True, position: int = 0):
+    """A tqdm bar when enabled+available, else a silent no-op with the same interface."""
+    if enable:
+        try:
+            from tqdm import tqdm
+
+            return tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True, leave=leave, position=position)
+        except Exception:
+            pass
+    return _NullBar()
+
+
+def setup_logging(verbose: bool, progress: bool = True) -> None:
+    # Stream output line-by-line so logs/bars appear promptly even through a pipe.
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+    handler: logging.Handler = _TqdmLoggingHandler() if progress else logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(handler)
+
+
+def auto_workers(kind: str) -> int:
+    """Pick a sensible default worker count from the CPU core count."""
+    cores = os.cpu_count() or 4
+    if kind == "solver":
+        # Disk-bound COLMAP undistort: 2 concurrent solves usually saturate disk without thrash.
+        return 2 if cores >= 8 else 1
+    # crop export (cv2, GIL-released): more threads overlap disk, capped to avoid contention.
+    return max(1, min(cores, 8))
 
 
 def resolve_colmap(colmap_arg: str) -> str:
@@ -599,6 +664,92 @@ class SuperGlueMatcher:
 
     def match_pair(self, image0: Path, image1: Path, resize: Sequence[int] | None = None) -> np.ndarray:
         return self.match_cached(self.detect(image0, resize), self.detect(image1, resize))
+
+
+class WaftFlowRunner:
+    """In-process WAFT optical-flow inference (loads the model once, reuses it).
+
+    Mirrors SuperGlueMatcher's lazy-import-from-an-external-repo pattern so the whole
+    SuperGlue + COLMAP + WAFT pipeline runs from a single command/process.
+    """
+
+    def __init__(self, waft_root: Path, cfg: Path, ckpt: Path, device: str,
+                 scale: float | None = None, max_size: int = 0) -> None:
+        self.waft_root = Path(waft_root).resolve()
+        if not self.waft_root.exists():
+            raise FileNotFoundError(f"WAFT root does not exist: {self.waft_root}")
+        cfg_path = cfg if Path(cfg).is_absolute() else self.waft_root / cfg
+        ckpt_path = ckpt if Path(ckpt).is_absolute() else self.waft_root / ckpt
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"WAFT config not found: {cfg_path}")
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"WAFT checkpoint not found: {ckpt_path}")
+        sys.path.insert(0, str(self.waft_root))
+
+        import torch
+        from config.parser import json_to_args
+        from model import fetch_model
+        from utils.utils import load_ckpt
+        from inference_tools import InferenceWrapper
+
+        if device == "cuda" and not torch.cuda.is_available():
+            LOGGER.warning("CUDA requested for WAFT but unavailable; using CPU")
+            device = "cpu"
+        self.torch = torch
+        self.device = device
+        self.max_size = int(max_size)
+
+        cfg_args = json_to_args(str(cfg_path))
+        if scale is not None:
+            cfg_args.scale = scale
+        model = fetch_model(cfg_args)
+        load_ckpt(model, str(ckpt_path))
+        model = model.to(device).eval()
+        torch.set_grad_enabled(False)
+        self.model = model
+        self.wrapper = InferenceWrapper(
+            model,
+            scale=cfg_args.scale,
+            train_size=getattr(cfg_args, "image_size", None),
+            pad_to_train_size=False,
+            tiling=False,
+        )
+
+    def _read_rgb(self, path: Path) -> np.ndarray:
+        import cv2
+
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"failed to read image: {path}")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def flow(self, image0: Path, image1: Path) -> np.ndarray:
+        """Forward optical flow image0 -> image1 as (H, W, 2) float32 in raw pixels.
+
+        Output is at the input (native) resolution. If max_size > 0 the inputs are
+        downscaled so the long side <= max_size and the resulting flow is rescaled back
+        to that downscaled grid (still pixel-aligned to a same-ratio image)."""
+        import cv2
+
+        rgb0 = self._read_rgb(image0)
+        rgb1 = self._read_rgb(image1)
+        if rgb0.shape[:2] != rgb1.shape[:2]:
+            raise RuntimeError(
+                f"WAFT pair has mismatched sizes: {image0.name}{rgb0.shape[:2]} vs "
+                f"{image1.name}{rgb1.shape[:2]}"
+            )
+        if self.max_size and max(rgb0.shape[:2]) > self.max_size:
+            h, w = rgb0.shape[:2]
+            s = self.max_size / float(max(h, w))
+            new_wh = (max(1, int(round(w * s))), max(1, int(round(h * s))))
+            rgb0 = cv2.resize(rgb0, new_wh, interpolation=cv2.INTER_AREA)
+            rgb1 = cv2.resize(rgb1, new_wh, interpolation=cv2.INTER_AREA)
+
+        t0 = self.torch.tensor(rgb0, dtype=self.torch.float32).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        t1 = self.torch.tensor(rgb1, dtype=self.torch.float32).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        output = self.wrapper.calc_flow(t0, t1)
+        flow = output["flow"][-1][0].permute(1, 2, 0).contiguous().cpu().numpy()
+        return flow.astype(np.float32, copy=False)
 
 
 def filter_corrs(
@@ -1104,6 +1255,95 @@ def triangulate_observations(observations: Sequence[tuple[ColmapCamera, ColmapIm
     return xyz
 
 
+VELOCITY_DROP_KEYS = ("too_few_views", "triangulate", "gate", "depth", "reproj", "angle", "magnitude")
+
+
+def velocity_from_observations(point_xyz: np.ndarray, observations: list, args, track_len: int):
+    """Triangulate flow-displaced observations into a 3D velocity for ONE point.
+
+    observations: list[(ColmapCamera, ColmapImage, up, vp)] (already flow-displaced).
+    Returns (result, drop_reason). On success result = (velocity(3,) float32, confidence,
+    view_count) and drop_reason is None; on rejection result is None and drop_reason names
+    the gate (one of VELOCITY_DROP_KEYS)."""
+    min_views = args.velocity_min_views
+    if len(observations) < min_views:
+        return None, "too_few_views"
+    gate_schedule = [
+        args.velocity_max_reproj_error * 4.0,
+        args.velocity_max_reproj_error * 2.0,
+        args.velocity_max_reproj_error,
+    ]
+    active = observations
+    xyz_next = triangulate_observations(active)
+    if xyz_next is None:
+        return None, "triangulate"
+    for gate in gate_schedule:
+        gated = []
+        for obs in active:
+            camera, image, up, vp = obs
+            pu, pv, depth = camera_project(camera, image, xyz_next)
+            resid = float(np.hypot(pu - up, pv - vp)) if np.isfinite(pu) and np.isfinite(pv) else np.inf
+            if depth > 1e-8 and resid <= gate:
+                gated.append(obs)
+        if len(gated) < min_views:
+            return None, "gate"
+        active = gated
+        xyz_refined = triangulate_observations(active)
+        if xyz_refined is None:
+            return None, "gate"
+        xyz_next = xyz_refined
+
+    final_residuals = []
+    positive_depths = 0
+    for camera, image, up, vp in active:
+        pu, pv, depth = camera_project(camera, image, xyz_next)
+        if depth > 1e-8:
+            positive_depths += 1
+        final_residuals.append(float(np.hypot(pu - up, pv - vp)) if np.isfinite(pu) and np.isfinite(pv) else np.inf)
+    if positive_depths < min_views:
+        return None, "depth"
+    median_resid = float(np.median(final_residuals))
+    if median_resid > args.velocity_max_reproj_error:
+        return None, "reproj"
+    angle = triangulation_angle_deg(active)
+    if angle < args.velocity_min_angle:
+        return None, "angle"
+
+    velocity = (xyz_next - point_xyz) / args.velocity_dt
+    speed = float(np.linalg.norm(velocity))
+    if args.velocity_max_magnitude > 0 and speed > args.velocity_max_magnitude:
+        return None, "magnitude"
+
+    track_ratio = len(active) / max(track_len, 1)
+    reproj_score = np.exp(-median_resid / max(args.velocity_max_reproj_error, 1e-6))
+    angle_score = min(angle / max(args.velocity_min_angle * 4.0, 1e-6), 1.0)
+    confidence = float(np.clip(track_ratio * reproj_score * angle_score, 0.0, 1.0))
+    return (velocity.astype(np.float32), confidence, len(active)), None
+
+
+def log_velocity_summary(label: str, valid_count: int, n: int, drops: dict,
+                         applied_disp_px: list, median_width: float, args) -> None:
+    LOGGER.info("%s: %d/%d points passed multi-view flow triangulation", label, valid_count, n)
+    LOGGER.info(
+        "%s drops: too_few_views=%d triangulate=%d gate=%d depth=%d reproj=%d angle=%d magnitude=%d",
+        label, drops["too_few_views"], drops["triangulate"], drops["gate"], drops["depth"],
+        drops["reproj"], drops["angle"], drops["magnitude"],
+    )
+    if applied_disp_px:
+        median_disp = float(np.median(applied_disp_px))
+        LOGGER.info(
+            "%s: median applied flow displacement = %.3f px (flow_format=%s, flow_direction=%s)",
+            label, median_disp, args.flow_format, getattr(args, "flow_direction", "forward"),
+        )
+        if median_width > 0 and median_disp > 0.1 * median_width:
+            LOGGER.warning(
+                "%s: median flow displacement %.1f px is >10%% of image width (%.0f px) — this usually "
+                "means --flow_format is wrong for your flow files (WAFT outputs raw pixels -> --flow_format "
+                "pixel) or the flow was measured in a different image space than the model.",
+                label, median_disp, median_width,
+            )
+
+
 def estimate_flow_velocity_for_points(
     points: Sequence[ColmapPoint3D],
     cameras: dict[int, ColmapCamera],
@@ -1121,14 +1361,11 @@ def estimate_flow_velocity_for_points(
         LOGGER.info("velocity: no flow files found in %s", flow_dir)
         return VelocityResult(velocities, valid, confidence, view_counts)
 
-    gate_schedule = [
-        args.velocity_max_reproj_error * 4.0,
-        args.velocity_max_reproj_error * 2.0,
-        args.velocity_max_reproj_error,
-    ]
+    direction_sign = -1.0 if getattr(args, "flow_direction", "forward") == "backward" else 1.0
+    drops = {k: 0 for k in VELOCITY_DROP_KEYS}
+    applied_disp_px: list[float] = []
     for idx, point in enumerate(points):
         observations: list[tuple[ColmapCamera, ColmapImage, float, float]] = []
-        track_view_count = 0
         for image_id, point2d_idx in point.track:
             image = images.get(image_id)
             if image is None or point2d_idx < 0 or point2d_idx >= len(image.xys):
@@ -1137,7 +1374,6 @@ def estimate_flow_velocity_for_points(
             flow = flows.get(image.name)
             if flow is None:
                 continue
-            track_view_count += 1
             u, v = image.xys[point2d_idx]
             if not (0 <= u < camera.width and 0 <= v < camera.height):
                 continue
@@ -1146,80 +1382,224 @@ def estimate_flow_velocity_for_points(
             if sample is None:
                 continue
             du, dv = flow_to_pixel_delta(
-                sample[0],
-                sample[1],
-                flow_w,
-                flow_h,
-                camera.width,
-                camera.height,
-                args.flow_format,
-                args.flow_scale,
+                sample[0], sample[1], flow_w, flow_h, camera.width, camera.height,
+                args.flow_format, args.flow_scale,
             )
+            du *= direction_sign
+            dv *= direction_sign
+            applied_disp_px.append(float(np.hypot(du, dv)))
             up = float(u + du)
             vp = float(v + dv)
             if 0 <= up < camera.width and 0 <= vp < camera.height:
                 observations.append((camera, image, up, vp))
 
-        if len(observations) < args.velocity_min_views:
+        result, reason = velocity_from_observations(point.xyz, observations, args, len(point.track))
+        if reason is not None:
+            drops[reason] += 1
             continue
-
-        active = observations
-        xyz_next = triangulate_observations(active)
-        if xyz_next is None:
-            continue
-        for gate in gate_schedule:
-            gated = []
-            residuals = []
-            for obs in active:
-                camera, image, up, vp = obs
-                pu, pv, depth = camera_project(camera, image, xyz_next)
-                resid = float(np.hypot(pu - up, pv - vp)) if np.isfinite(pu) and np.isfinite(pv) else np.inf
-                if depth > 1e-8 and resid <= gate:
-                    gated.append(obs)
-                    residuals.append(resid)
-            if len(gated) < args.velocity_min_views:
-                active = []
-                break
-            active = gated
-            xyz_refined = triangulate_observations(active)
-            if xyz_refined is None:
-                active = []
-                break
-            xyz_next = xyz_refined
-        if len(active) < args.velocity_min_views:
-            continue
-
-        final_residuals = []
-        positive_depths = 0
-        for camera, image, up, vp in active:
-            pu, pv, depth = camera_project(camera, image, xyz_next)
-            if depth > 1e-8:
-                positive_depths += 1
-            final_residuals.append(float(np.hypot(pu - up, pv - vp)) if np.isfinite(pu) and np.isfinite(pv) else np.inf)
-        if positive_depths < args.velocity_min_views:
-            continue
-        median_resid = float(np.median(final_residuals))
-        if median_resid > args.velocity_max_reproj_error:
-            continue
-        angle = triangulation_angle_deg(active)
-        if angle < args.velocity_min_angle:
-            continue
-
-        velocity = (xyz_next - point.xyz) / args.velocity_dt
-        speed = float(np.linalg.norm(velocity))
-        if args.velocity_max_magnitude > 0 and speed > args.velocity_max_magnitude:
-            continue
-
-        velocities[idx] = velocity.astype(np.float32)
+        velocity, conf, views = result
+        velocities[idx] = velocity
         valid[idx] = True
-        view_counts[idx] = min(len(active), 255)
-        track_ratio = len(active) / max(len(point.track), 1)
-        reproj_score = np.exp(-median_resid / max(args.velocity_max_reproj_error, 1e-6))
-        angle_score = min(angle / max(args.velocity_min_angle * 4.0, 1e-6), 1.0)
-        confidence[idx] = float(np.clip(track_ratio * reproj_score * angle_score, 0.0, 1.0))
+        view_counts[idx] = min(views, 255)
+        confidence[idx] = conf
 
-    LOGGER.info("velocity: %d/%d points passed multi-view flow triangulation", int(valid.sum()), n)
+    median_w = float(np.median([c.width for c in cameras.values()])) if cameras else 0.0
+    log_velocity_summary("velocity", int(valid.sum()), n, drops, applied_disp_px, median_w, args)
     return VelocityResult(velocities, valid, confidence, view_counts)
+
+
+def estimate_velocity_undistorted(
+    points_xyz: np.ndarray,
+    points_cam_names: list,
+    undist_cam_by_name: dict,
+    rig_image_by_name: dict,
+    flow_dir: Path,
+    args,
+) -> VelocityResult:
+    """Velocity in the UNDISTORTED PINHOLE space, from flow measured on undistorted images.
+
+    Each 3D point is projected through the shared PINHOLE camera (rig poses are identical
+    across frames), the undistorted-space flow is sampled there, the point is displaced and
+    re-triangulated. Flow is native-resolution so sampling is exact."""
+    n = len(points_xyz)
+    velocities = np.zeros((n, 3), dtype=np.float32)
+    valid = np.zeros(n, dtype=bool)
+    confidence = np.zeros(n, dtype=np.float32)
+    view_counts = np.zeros(n, dtype=np.uint8)
+    needed = sorted({nm for lst in points_cam_names for nm in lst}, key=natural_key)
+    flows = load_flow_maps(flow_dir, needed)
+    if not flows:
+        LOGGER.info("velocity(undist): no flow files found in %s", flow_dir)
+        return VelocityResult(velocities, valid, confidence, view_counts)
+
+    direction_sign = -1.0 if getattr(args, "flow_direction", "forward") == "backward" else 1.0
+    drops = {k: 0 for k in VELOCITY_DROP_KEYS}
+    applied_disp_px: list[float] = []
+    for idx in range(n):
+        xyz = np.asarray(points_xyz[idx], dtype=np.float64)
+        observations: list[tuple[ColmapCamera, ColmapImage, float, float]] = []
+        for name in points_cam_names[idx]:
+            camera = undist_cam_by_name.get(name)
+            image = rig_image_by_name.get(name)
+            flow = flows.get(name)
+            if camera is None or image is None or flow is None:
+                continue
+            pu, pv, depth = camera_project(camera, image, xyz)
+            if depth <= 1e-8 or not np.isfinite(pu) or not np.isfinite(pv):
+                continue
+            if not (0 <= pu < camera.width and 0 <= pv < camera.height):
+                continue
+            flow_h, flow_w = flow.shape[:2]
+            sample = bilinear_sample_flow(flow, pu * flow_w / camera.width, pv * flow_h / camera.height)
+            if sample is None:
+                continue
+            du, dv = flow_to_pixel_delta(
+                sample[0], sample[1], flow_w, flow_h, camera.width, camera.height,
+                args.flow_format, args.flow_scale,
+            )
+            du *= direction_sign
+            dv *= direction_sign
+            applied_disp_px.append(float(np.hypot(du, dv)))
+            up = float(pu + du)
+            vp = float(pv + dv)
+            if 0 <= up < camera.width and 0 <= vp < camera.height:
+                observations.append((camera, image, up, vp))
+
+        result, reason = velocity_from_observations(xyz, observations, args, len(points_cam_names[idx]))
+        if reason is not None:
+            drops[reason] += 1
+            continue
+        velocity, conf, views = result
+        velocities[idx] = velocity
+        valid[idx] = True
+        view_counts[idx] = min(views, 255)
+        confidence[idx] = conf
+
+    median_w = float(np.median([c.width for c in undist_cam_by_name.values()])) if undist_cam_by_name else 0.0
+    log_velocity_summary("velocity(undist)", int(valid.sum()), n, drops, applied_disp_px, median_w, args)
+    return VelocityResult(velocities, valid, confidence, view_counts)
+
+
+def write_point_cache(path: Path, points: Sequence[ColmapPoint3D], images: dict[int, ColmapImage]) -> None:
+    """Persist (xyz, rgb, per-point observing camera names) for the deferred velocity pass."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(points)
+    xyz = np.array([p.xyz for p in points], dtype=np.float32).reshape(n, 3) if n else np.zeros((0, 3), np.float32)
+    rgb = np.array([p.rgb for p in points], dtype=np.uint8).reshape(n, 3) if n else np.zeros((0, 3), np.uint8)
+    name_lists: list[list[str]] = []
+    for p in points:
+        names = [images[i].name for i, _ in p.track if i in images]
+        name_lists.append(names)
+    table = sorted({nm for names in name_lists for nm in names}, key=natural_key)
+    table_index = {nm: i for i, nm in enumerate(table)}
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    flat: list[int] = []
+    for i, names in enumerate(name_lists):
+        flat.extend(table_index[nm] for nm in names)
+        offsets[i + 1] = len(flat)
+    np.savez(
+        path,
+        xyz=xyz,
+        rgb=rgb,
+        cam_table=np.array(table, dtype="U") if table else np.array([], dtype="U1"),
+        idx_flat=np.array(flat, dtype=np.int64),
+        offsets=offsets,
+    )
+
+
+def read_point_cache(path: Path) -> tuple[np.ndarray, np.ndarray, list[list[str]]]:
+    data = np.load(path, allow_pickle=False)
+    xyz = data["xyz"]
+    rgb = data["rgb"]
+    cam_table = [str(x) for x in data["cam_table"]]
+    idx_flat = data["idx_flat"]
+    offsets = data["offsets"]
+    name_lists = [
+        [cam_table[j] for j in idx_flat[offsets[i]:offsets[i + 1]]]
+        for i in range(len(xyz))
+    ]
+    return xyz, rgb, name_lists
+
+
+def compute_flows_for_frames(selected_frames: Sequence[Path], args, runner: WaftFlowRunner) -> int:
+    """Phase 2: forward WAFT flow N->N+1 per camera, on the undistorted output images.
+
+    Writes output_root/flows/<N>/<cam>.npy aligned 1:1 with undistorted/images/<N>/<cam>."""
+    images_root = args.output_root / "undistorted" / "images"
+    flows_root = args.output_root / "flows"
+    frame_names = [f.name for f in selected_frames]
+
+    # Build the work list once so the progress bar has an exact total.
+    pairs: list[tuple[str, str, list[str], dict, dict]] = []
+    for i in range(len(frame_names) - 1):
+        a, b = frame_names[i], frame_names[i + 1]
+        dir_a = images_root / a
+        dir_b = images_root / b
+        if not dir_a.exists() or not dir_b.exists():
+            LOGGER.warning("flow: missing undistorted images for %s or %s; skipping pair", a, b)
+            continue
+        files_a = {p.stem: p for p in dir_a.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES}
+        files_b = {p.stem: p for p in dir_b.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES}
+        common = sorted(set(files_a) & set(files_b), key=natural_key)
+        pairs.append((a, b, common, files_a, files_b))
+
+    grand_total = sum(len(c) for _, _, c, _, _ in pairs)
+    LOGGER.info("flow: computing %d flow maps over %d frame pairs", grand_total, len(pairs))
+    bar = make_pbar(grand_total, "flow", "map", args.progress)
+    total = 0
+    for a, b, common, files_a, files_b in pairs:
+        out_dir = flows_root / a
+        out_dir.mkdir(parents=True, exist_ok=True)
+        wrote = 0
+        bar.set_postfix_str(f"{a}->{b}")
+        for cam in common:
+            out_path = out_dir / f"{cam}.npy"
+            if not (args.skip_existing_flow and out_path.exists()):
+                flow = runner.flow(files_a[cam], files_b[cam])
+                np.save(out_path, flow)
+                wrote += 1
+                total += 1
+            bar.update(1)
+        LOGGER.info("flow: %s->%s wrote %d/%d cameras", a, b, wrote, len(common))
+    bar.close()
+    LOGGER.info("flow: wrote %d flow maps under %s", total, flows_root)
+    return total
+
+
+def run_undistorted_velocity_pass(args, colmap: str, selected_frames: Sequence[Path]) -> None:
+    """Phase 3: compute vx/vy/vz in undistorted space from the generated flows, write points/<N>.ply."""
+    shared_model = args.output_root / "undistorted" / "sparse" / "0"
+    if not shared_model.exists():
+        LOGGER.warning("velocity: shared undistorted model %s missing; skipping velocity pass", shared_model)
+        return
+    cache_dir = args.output_root / "_flowcache"
+    cameras, images, _ = read_colmap_model_any(colmap, shared_model, cache_dir / "_shared_txt", cache_dir)
+    undist_cam_by_name = {img.name: cameras[img.camera_id] for img in images.values()}
+    rig_image_by_name = {img.name: img for img in images.values()}
+    flows_root = args.output_root / "flows"
+    for frame in selected_frames:
+        name = frame.name
+        cache_path = cache_dir / f"{name}.npz"
+        out_ply = args.output_root / "points" / f"{name}.ply"
+        if not cache_path.exists():
+            LOGGER.warning("velocity: point cache %s missing; skipping %s", cache_path, name)
+            continue
+        xyz, rgb, name_lists = read_point_cache(cache_path)
+        flow_dir = flows_root / name
+        velocity_result = None
+        if flow_dir.exists():
+            velocity_result = estimate_velocity_undistorted(
+                xyz, name_lists, undist_cam_by_name, rig_image_by_name, flow_dir, args
+            )
+        else:
+            LOGGER.info("velocity: %s has no forward flow (e.g. last frame); writing zero velocity", name)
+        pts = [
+            ColmapPoint3D(point_id=i + 1, xyz=xyz[i], rgb=rgb[i], error=0.0, track=[])
+            for i in range(len(xyz))
+        ]
+        write_points_ply(out_ply, pts, velocity_result, ascii=args.ply_ascii)
+    if not args.keep_workspace:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 def filter_points(
@@ -1584,14 +1964,21 @@ def undistort_and_export(colmap: str, paths: FramePaths, args, model_dir: Path, 
     out_img_dir = export_ctx.images_root / paths.output_name
     if out_img_dir.exists():
         shutil.rmtree(out_img_dir)
-    cropped = 0
-    for src in sorted(src_dir.iterdir()):
-        spec = export_ctx.crop_by_name.get(src.name)
-        if spec is None:
-            continue
-        crop_image_file(src, out_img_dir / src.name, spec)
-        cropped += 1
-    LOGGER.info("export: %s -> %d undistorted+centered images", paths.output_name, cropped)
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    jobs = [
+        (src, out_img_dir / src.name, export_ctx.crop_by_name[src.name])
+        for src in sorted(src_dir.iterdir())
+        if src.name in export_ctx.crop_by_name
+    ]
+    # cv2 read/crop/write releases the GIL, so threads give real multi-core + disk overlap.
+    workers = int(getattr(args, "export_workers", 0)) or auto_workers("export")
+    if workers > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda j: crop_image_file(j[0], j[1], j[2]), jobs))
+    else:
+        for src, dst, spec in jobs:
+            crop_image_file(src, dst, spec)
+    LOGGER.info("export: %s -> %d undistorted+centered images", paths.output_name, len(jobs))
 
 
 @dataclass(frozen=True)
@@ -1687,6 +2074,7 @@ def match_frame_pairs(
     used_names = sorted({n for pair in pairs for n in pair}, key=natural_key)
     feats: dict[str, dict] = {}
     workers = max(1, int(getattr(args, "decode_workers", 4)))
+    dbar = make_pbar(len(used_names), f"detect {output_name}", "img", getattr(args, "progress", True), leave=False, position=1)
     if workers > 1 and len(used_names) > 1:
         prefetch = max(workers, 2)
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1698,16 +2086,20 @@ def match_frame_pairs(
                     pending[n] = pool.submit(matcher._decode, image_infos[n].path, resize)
                     next_idx += 1
                 feats[name] = matcher._encode(pending.pop(name).result())
+                dbar.update(1)
     else:
         for name in used_names:
             feats[name] = matcher.detect(image_infos[name].path, resize)
+            dbar.update(1)
+    dbar.close()
 
     pair_matches: list[PairMatch] = []
     raw_total = 0
     kept_total = 0
     skipped_pairs = 0
+    bar = make_pbar(len(pairs), f"match {output_name}", "pair", getattr(args, "progress", True), leave=False, position=1)
     for idx, (name0, name1) in enumerate(pairs, start=1):
-        if idx == 1 or idx % args.log_every == 0:
+        if args.verbose and (idx == 1 or idx % args.log_every == 0):
             LOGGER.info("%s: matching pair %d/%d (%s, %s)", output_name, idx, len(pairs), name0, name1)
         raw = matcher.match_cached(feats[name0], feats[name1])
         raw_total += len(raw)
@@ -1717,6 +2109,8 @@ def match_frame_pairs(
             pair_matches.append(PairMatch(name0=name0, name1=name1, matches=kept))
         else:
             skipped_pairs += 1
+        bar.update(1)
+    bar.close()
 
     match_stats = {
         "num_candidate_pairs": len(pairs),
@@ -1744,8 +2138,15 @@ def finalize_frame(
     points = filter_points(points, args.ply_min_track_len, args.ply_max_reproj_error)
     LOGGER.info("%s: %d/%d points kept after track/error filtering", paths.output_name, len(points), raw_num_points)
 
+    # In the integrated WAFT mode, velocity is computed AFTER flows are generated (Phase 3,
+    # undistorted space). We still write a plain points/<N>.ply now (so progress is visible and
+    # an interrupted run keeps its points) plus a cache of observing cameras; Phase 3 overwrites
+    # the PLY with velocity. Legacy mode (external flow, no --compute_flow) computes it inline.
+    defer_velocity = args.compute_flow and args.compute_velocity
     velocity_result = None
-    if args.compute_velocity:
+    if defer_velocity:
+        write_point_cache(args.output_root / "_flowcache" / f"{paths.output_name}.npz", points, images)
+    elif args.compute_velocity:
         flow_dir = args.flows_root / frame_dir.name
         if not flow_dir.exists():
             flow_dir = args.flows_root / paths.output_name
@@ -2132,10 +2533,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decode_workers", type=int, default=4,
                         help="Threads that pre-decode images so disk/CPU decode overlaps GPU detection "
                              "(1 disables prefetch).")
+    parser.add_argument("--solver_workers", type=int, default=0,
+                        help="In --static_rig --pipeline, how many frame solves (COLMAP triangulate + "
+                             "undistort + crop) run concurrently while the GPU matches ahead. "
+                             "0 = auto from CPU cores. Keep modest: these are disk-bound.")
+    parser.add_argument("--export_workers", type=int, default=0,
+                        help="Threads for the per-frame undistorted-image crop/write (cv2). "
+                             "0 = auto from CPU cores.")
 
     parser.add_argument("--compute_velocity", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--flows_root", type=Path, default=Path("data/twopeople/flows"))
-    parser.add_argument("--flow_format", choices=["norm", "midnorm", "pixel"], default="norm")
+    parser.add_argument("--flows_root", type=Path, default=Path("data/twopeople/flows"),
+                        help="Legacy: external flow directory, only used with --no-compute_flow. "
+                             "With --compute_flow, flows are generated to output_root/flows/.")
+
+    # --- Integrated WAFT optical-flow stage (one command: images -> flows/points/undistorted) ---
+    parser.add_argument("--compute_flow", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run WAFT on the undistorted output images (forward N->N+1 per camera) and "
+                             "write output_root/flows/<N>/<cam>.npy aligned 1:1 with undistorted/images. "
+                             "When on, velocity is computed in undistorted space from these flows.")
+    parser.add_argument("--waft_root", type=Path, default=Path("f:/project/WAFT"),
+                        help="Path to the WAFT repo (imported in-process).")
+    parser.add_argument("--waft_cfg", type=Path, default=Path("config/a2/twins/chairs-things.json"),
+                        help="WAFT config JSON (relative to --waft_root unless absolute).")
+    parser.add_argument("--waft_ckpt", type=Path, default=Path("ckpts/a2/waftv2-ckpts/twins/zero-shot.pth"),
+                        help="WAFT checkpoint (relative to --waft_root unless absolute).")
+    parser.add_argument("--waft_scale", type=float, default=None,
+                        help="Override WAFT inference scale (2**scale input resize); default = config value.")
+    parser.add_argument("--flow_max_size", type=int, default=0,
+                        help="Cap the long side fed to WAFT (0 = native undistorted resolution). Lower it if "
+                             "WAFT runs out of GPU memory; flow is produced at that reduced size.")
+    parser.add_argument("--flow_device", default=None,
+                        help="Device for WAFT (default = --device).")
+    parser.add_argument("--skip_existing_flow", action=argparse.BooleanOptionalAction, default=False,
+                        help="Skip flow pairs whose .npy already exists (resume a previous run).")
+
+    parser.add_argument("--flow_format", choices=["norm", "midnorm", "pixel"], default="pixel",
+                        help="Units of the flow .npy values. 'pixel' = raw pixel displacement at the "
+                             "flow-map resolution (WAFT/RAFT default; rescaled by image/flow size). "
+                             "'norm' = fraction of image size; 'midnorm' = [-1,1] over the image.")
+    parser.add_argument("--flow_direction", choices=["forward", "backward"], default="forward",
+                        help="'forward' = flow maps frame N -> N+1 (WAFT image1->image2; what the "
+                             "velocity model expects). 'backward' negates the flow so N+1->N maps can "
+                             "be reused without re-running the flow.")
     parser.add_argument("--flow_scale", type=float, default=1.0)
     parser.add_argument("--velocity_dt", type=float, default=1.0)
     parser.add_argument("--velocity_min_views", type=int, default=3)
@@ -2173,6 +2612,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fusion_min_num_pixels", type=int, default=3)
 
     parser.add_argument("--log_every", type=int, default=25)
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True,
+                        help="Show tqdm progress bars with ETA (frames, matching pairs, flow). "
+                             "Use --no-progress for plain logs (e.g. when redirecting to a file).")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -2180,7 +2622,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    setup_logging(args.verbose)
+    setup_logging(args.verbose, args.progress)
 
     args.images_root = args.images_root.resolve()
     args.output_root = args.output_root.resolve()
@@ -2199,6 +2641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOGGER.info("selected frames: %s", ", ".join(p.name for p in selected_frames))
     matcher = make_matcher(args)
     all_stats = []
+    frame_bar = make_pbar(len(selected_frames), "frames", "frame", args.progress)
 
     if args.static_rig:
         by_name = {p.name: p for p in frame_dirs}
@@ -2211,8 +2654,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             sparse_dir=args.output_root / "undistorted" / "sparse" / "0",
         ) if args.undistort else None
         LOGGER.info("static rig: solving reference poses from frame '%s'", ref_name)
+        frame_bar.set_postfix_str(f"ref {ref_name}")
         ref_stats, ref_cameras, ref_images, ref_points = reconstruct_frame(ref_frame, ref_name, args, colmap, matcher, export_ctx)
         all_stats.append(ref_stats)
+        frame_bar.update(1)
         ref_pose_by_name = {
             img.name: RigPose(img.image_id, img.qvec, img.tvec, img.camera_id)
             for img in ref_images.values()
@@ -2235,45 +2680,104 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         rig_frames = [f for f in selected_frames if f.name != ref_name]
         if args.pipeline and len(rig_frames) > 1:
-            # Overlap frame N's CPU triangulation/export with frame N+1's GPU matching.
-            # Frames are independent (shared fixed poses), so the output is unchanged.
-            with ThreadPoolExecutor(max_workers=1) as solver:
-                pending = None
+            # Overlap each frame's CPU/disk solve (triangulate + undistort + crop) with the
+            # GPU matching of later frames. Frames are independent (shared fixed poses), so the
+            # output is unchanged. A pool of `solver_workers` runs several disk-bound solves
+            # concurrently while the GPU matches ahead; a bounded backlog caps RAM (each holds
+            # that frame's pair_matches) and the GPU blocks only when the backlog is full.
+            solver_workers = int(args.solver_workers) or auto_workers("solver")
+            max_inflight = solver_workers + 1
+            LOGGER.info("pipeline: %d solver worker(s), %d export thread(s)",
+                        solver_workers, int(args.export_workers) or auto_workers("export"))
+            with ThreadPoolExecutor(max_workers=solver_workers) as solver:
+                inflight: deque = deque()
                 for frame_dir in rig_frames:
+                    frame_bar.set_postfix_str(frame_dir.name)
                     match = rig_match_stage(
                         frame_dir, frame_dir.name, args, colmap, matcher,
                         ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs,
                     )
-                    if pending is not None:
-                        all_stats.append(pending.result()[0])
-                    pending = solver.submit(
+                    while len(inflight) >= max_inflight:
+                        all_stats.append(inflight.popleft().result()[0])
+                        frame_bar.update(1)
+                    inflight.append(solver.submit(
                         rig_solve_stage, match, args, colmap, ref_cameras, ref_pose_by_name, export_ctx,
-                    )
-                if pending is not None:
-                    all_stats.append(pending.result()[0])
+                    ))
+                while inflight:
+                    all_stats.append(inflight.popleft().result()[0])
+                    frame_bar.update(1)
         else:
             for frame_dir in rig_frames:
+                frame_bar.set_postfix_str(frame_dir.name)
                 stats, _, _, _ = triangulate_frame_with_rig(
                     frame_dir, frame_dir.name, args, colmap, matcher, ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs, export_ctx
                 )
                 all_stats.append(stats)
+                frame_bar.update(1)
     else:
         for frame_dir in selected_frames:
+            frame_bar.set_postfix_str(frame_dir.name)
             stats, _, _, _ = reconstruct_frame(frame_dir, frame_dir.name, args, colmap, matcher)
             all_stats.append(stats)
+            frame_bar.update(1)
+
+    frame_bar.close()
+
+    # Phase 2 (WAFT flows on undistorted images) + Phase 3 (undistorted-space velocity).
+    if args.compute_flow:
+        if not args.undistort:
+            LOGGER.warning("--compute_flow needs --undistort (flows are computed on undistorted images); skipping")
+        else:
+            del matcher  # free SuperGlue VRAM before loading WAFT
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            runner = None
+            try:
+                runner = WaftFlowRunner(
+                    args.waft_root, args.waft_cfg, args.waft_ckpt,
+                    args.flow_device or args.device, args.waft_scale, args.flow_max_size,
+                )
+            except Exception as exc:
+                LOGGER.warning("WAFT flow stage skipped: %s", exc)
+            if runner is not None:
+                compute_flows_for_frames(selected_frames, args, runner)
+                del runner
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                if args.compute_velocity:
+                    if args.static_rig:
+                        run_undistorted_velocity_pass(args, colmap, selected_frames)
+                    else:
+                        LOGGER.warning("velocity in undistorted space currently supports --static_rig only; "
+                                       "flows were written but points/*.ply have no velocity")
 
     if args.undistort:
         LOGGER.info("3DGS export: images=%s  shared sparse=%s",
                     args.output_root / "undistorted" / "images",
                     args.output_root / "undistorted" / "sparse" / "0")
+        if args.compute_flow:
+            LOGGER.info("flow export: %s (aligned 1:1 with undistorted/images)", args.output_root / "flows")
+    combined = args.compute_flow and args.compute_velocity
     for stats in all_stats:
-        LOGGER.info(
-            "%s: ply=%s velocity=%d/%d",
-            stats["output_name"],
-            stats["sparse_ply"],
-            stats["velocity_valid_points"],
-            stats["num_sparse_points"],
-        )
+        if combined:
+            LOGGER.info("%s: ply=%s (velocity logged above by the flow/velocity pass)",
+                        stats["output_name"], stats["sparse_ply"])
+        else:
+            LOGGER.info(
+                "%s: ply=%s velocity=%d/%d",
+                stats["output_name"],
+                stats["sparse_ply"],
+                stats["velocity_valid_points"],
+                stats["num_sparse_points"],
+            )
     return 0
 
 
