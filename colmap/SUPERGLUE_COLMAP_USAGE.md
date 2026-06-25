@@ -6,6 +6,13 @@
 
 > 大多数参数已经设了适合本数据集（约 100 路相机、4K 图像）的默认值，**正常情况下只需要几个参数**，见第 3 节。需要调的参数在第 5 节有详细解释。
 
+
+单帧运行：
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py `
+    --frames 1 --force `
+    --images_root .\data\two\images\ --output_root .\output\two-test `
+    --resize -1 `
+    --no-compute_velocity --no-compute_flow
 ---
 
 ## 1. 数据放法
