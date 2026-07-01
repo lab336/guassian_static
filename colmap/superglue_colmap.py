@@ -1258,7 +1258,13 @@ def triangulate_observations(observations: Sequence[tuple[ColmapCamera, ColmapIm
 VELOCITY_DROP_KEYS = ("too_few_views", "triangulate", "gate", "depth", "reproj", "angle", "magnitude")
 
 
-def velocity_from_observations(point_xyz: np.ndarray, observations: list, args, track_len: int):
+def velocity_from_observations(
+    point_xyz: np.ndarray,
+    observations: list,
+    args,
+    track_len: int,
+    velocity_dt_multiplier: float = 1.0,
+):
     """Triangulate flow-displaced observations into a 3D velocity for ONE point.
 
     observations: list[(ColmapCamera, ColmapImage, up, vp)] (already flow-displaced).
@@ -1309,7 +1315,7 @@ def velocity_from_observations(point_xyz: np.ndarray, observations: list, args, 
     if angle < args.velocity_min_angle:
         return None, "angle"
 
-    velocity = (xyz_next - point_xyz) / args.velocity_dt
+    velocity = (xyz_next - point_xyz) / (args.velocity_dt * velocity_dt_multiplier)
     speed = float(np.linalg.norm(velocity))
     if args.velocity_max_magnitude > 0 and speed > args.velocity_max_magnitude:
         return None, "magnitude"
@@ -1350,6 +1356,7 @@ def estimate_flow_velocity_for_points(
     images: dict[int, ColmapImage],
     flow_dir: Path,
     args,
+    velocity_dt_multiplier: float = 1.0,
 ) -> VelocityResult:
     n = len(points)
     velocities = np.zeros((n, 3), dtype=np.float32)
@@ -1393,7 +1400,9 @@ def estimate_flow_velocity_for_points(
             if 0 <= up < camera.width and 0 <= vp < camera.height:
                 observations.append((camera, image, up, vp))
 
-        result, reason = velocity_from_observations(point.xyz, observations, args, len(point.track))
+        result, reason = velocity_from_observations(
+            point.xyz, observations, args, len(point.track), velocity_dt_multiplier
+        )
         if reason is not None:
             drops[reason] += 1
             continue
@@ -1415,6 +1424,7 @@ def estimate_velocity_undistorted(
     rig_image_by_name: dict,
     flow_dir: Path,
     args,
+    velocity_dt_multiplier: float = 1.0,
 ) -> VelocityResult:
     """Velocity in the UNDISTORTED PINHOLE space, from flow measured on undistorted images.
 
@@ -1465,7 +1475,9 @@ def estimate_velocity_undistorted(
             if 0 <= up < camera.width and 0 <= vp < camera.height:
                 observations.append((camera, image, up, vp))
 
-        result, reason = velocity_from_observations(xyz, observations, args, len(points_cam_names[idx]))
+        result, reason = velocity_from_observations(
+            xyz, observations, args, len(points_cam_names[idx]), velocity_dt_multiplier
+        )
         if reason is not None:
             drops[reason] += 1
             continue
@@ -1521,18 +1533,71 @@ def read_point_cache(path: Path) -> tuple[np.ndarray, np.ndarray, list[list[str]
     return xyz, rgb, name_lists
 
 
-def compute_flows_for_frames(selected_frames: Sequence[Path], args, runner: WaftFlowRunner) -> int:
-    """Phase 2: forward WAFT flow N->N+1 per camera, on the undistorted output images.
+def build_flow_frame_pairs(selected_frames: Sequence[Path], frame_interval: int) -> list[tuple[str, str]]:
+    """Return source/target frame names for the configured flow anchors.
 
-    Writes output_root/flows/<N>/<cam>.npy aligned 1:1 with undistorted/images/<N>/<cam>."""
+    interval=1 preserves the old adjacent-frame behavior. interval=5 uses the
+    1st, 5th, 10th, ... selected frames as anchors, matching the requested
+    "first, fifth, tenth" sampling convention.
+    """
+    frame_names = [f.name for f in selected_frames]
+    if len(frame_names) < 2:
+        return []
+    if frame_interval <= 1:
+        anchor_indices = list(range(len(frame_names)))
+    else:
+        anchor_indices = [0]
+        anchor_indices.extend(i for i in range(frame_interval - 1, len(frame_names), frame_interval) if i != 0)
+    return [
+        (frame_names[anchor_indices[i]], frame_names[anchor_indices[i + 1]])
+        for i in range(len(anchor_indices) - 1)
+    ]
+
+
+def write_velocity_npz(
+    path: Path,
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    velocity: VelocityResult,
+    source_frame: str,
+    target_frame: str | None,
+    frame_interval: int,
+    velocity_dt: float,
+) -> None:
+    """Write velocities aligned 1:1 with the corresponding points/<frame>.ply vertices."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        xyz=np.asarray(xyz, dtype=np.float32),
+        rgb=np.asarray(rgb, dtype=np.uint8),
+        velocity=velocity.velocities.astype(np.float32, copy=False),
+        valid=velocity.valid.astype(np.bool_, copy=False),
+        confidence=velocity.confidence.astype(np.float32, copy=False),
+        view_counts=velocity.view_counts.astype(np.uint8, copy=False),
+        source_frame=np.array(source_frame),
+        target_frame=np.array("" if target_frame is None else target_frame),
+        frame_interval=np.array(int(frame_interval), dtype=np.int32),
+        velocity_dt=np.array(float(velocity_dt), dtype=np.float32),
+    )
+
+
+def compute_flows_for_frames(selected_frames: Sequence[Path], args, runner: WaftFlowRunner) -> int:
+    """Phase 2: forward WAFT flow between configured frame anchors, per camera.
+
+    Writes output_root/flows/<source>/<cam>.npy aligned 1:1 with undistorted/images/<source>/<cam>."""
     images_root = args.output_root / "undistorted" / "images"
     flows_root = args.output_root / "flows"
-    frame_names = [f.name for f in selected_frames]
+    frame_pairs = build_flow_frame_pairs(selected_frames, args.flow_frame_interval)
+    if not frame_pairs:
+        LOGGER.warning(
+            "flow: no frame pairs for --flow_frame_interval=%d over %d selected frames",
+            args.flow_frame_interval, len(selected_frames),
+        )
+        return 0
 
     # Build the work list once so the progress bar has an exact total.
     pairs: list[tuple[str, str, list[str], dict, dict]] = []
-    for i in range(len(frame_names) - 1):
-        a, b = frame_names[i], frame_names[i + 1]
+    for a, b in frame_pairs:
         dir_a = images_root / a
         dir_b = images_root / b
         if not dir_a.exists() or not dir_b.exists():
@@ -1550,16 +1615,39 @@ def compute_flows_for_frames(selected_frames: Sequence[Path], args, runner: Waft
     for a, b, common, files_a, files_b in pairs:
         out_dir = flows_root / a
         out_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = out_dir / "_pair.json"
+        skip_existing_for_pair = False
+        if args.skip_existing_flow and meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                skip_existing_for_pair = (
+                    meta.get("source_frame") == a
+                    and meta.get("target_frame") == b
+                    and int(meta.get("flow_frame_interval", 1)) == int(args.flow_frame_interval)
+                )
+            except Exception as exc:
+                LOGGER.warning("flow: failed to read %s for resume check: %s", meta_path, exc)
         wrote = 0
         bar.set_postfix_str(f"{a}->{b}")
         for cam in common:
             out_path = out_dir / f"{cam}.npy"
-            if not (args.skip_existing_flow and out_path.exists()):
+            if not (skip_existing_for_pair and out_path.exists()):
                 flow = runner.flow(files_a[cam], files_b[cam])
                 np.save(out_path, flow)
                 wrote += 1
                 total += 1
             bar.update(1)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "source_frame": a,
+                    "target_frame": b,
+                    "flow_frame_interval": int(args.flow_frame_interval),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         LOGGER.info("flow: %s->%s wrote %d/%d cameras", a, b, wrote, len(common))
     bar.close()
     LOGGER.info("flow: wrote %d flow maps under %s", total, flows_root)
@@ -1567,7 +1655,7 @@ def compute_flows_for_frames(selected_frames: Sequence[Path], args, runner: Waft
 
 
 def run_undistorted_velocity_pass(args, colmap: str, selected_frames: Sequence[Path]) -> None:
-    """Phase 3: compute vx/vy/vz in undistorted space from the generated flows, write points/<N>.ply."""
+    """Phase 3: compute vx/vy/vz for frames that have configured forward flow."""
     shared_model = args.output_root / "undistorted" / "sparse" / "0"
     if not shared_model.exists():
         LOGGER.warning("velocity: shared undistorted model %s missing; skipping velocity pass", shared_model)
@@ -1577,27 +1665,32 @@ def run_undistorted_velocity_pass(args, colmap: str, selected_frames: Sequence[P
     undist_cam_by_name = {img.name: cameras[img.camera_id] for img in images.values()}
     rig_image_by_name = {img.name: img for img in images.values()}
     flows_root = args.output_root / "flows"
-    for frame in selected_frames:
-        name = frame.name
+    frame_pairs = build_flow_frame_pairs(selected_frames, args.flow_frame_interval)
+    for name, target_name in frame_pairs:
         cache_path = cache_dir / f"{name}.npz"
         out_ply = args.output_root / "points" / f"{name}.ply"
+        out_velocity = args.output_root / "velocities" / f"{name}.npz"
         if not cache_path.exists():
             LOGGER.warning("velocity: point cache %s missing; skipping %s", cache_path, name)
             continue
         xyz, rgb, name_lists = read_point_cache(cache_path)
         flow_dir = flows_root / name
-        velocity_result = None
-        if flow_dir.exists():
-            velocity_result = estimate_velocity_undistorted(
-                xyz, name_lists, undist_cam_by_name, rig_image_by_name, flow_dir, args
-            )
-        else:
-            LOGGER.info("velocity: %s has no forward flow (e.g. last frame); writing zero velocity", name)
+        if not flow_dir.exists() or not any(flow_dir.glob("*.npy")):
+            LOGGER.warning("velocity: %s has no flow files for %s->%s; skipping", name, name, target_name)
+            continue
+        velocity_result = estimate_velocity_undistorted(
+            xyz, name_lists, undist_cam_by_name, rig_image_by_name, flow_dir, args, args.flow_frame_interval
+        )
+        write_velocity_npz(
+            out_velocity, xyz, rgb, velocity_result, name, target_name,
+            args.flow_frame_interval, args.velocity_dt,
+        )
         pts = [
             ColmapPoint3D(point_id=i + 1, xyz=xyz[i], rgb=rgb[i], error=0.0, track=[])
             for i in range(len(xyz))
         ]
         write_points_ply(out_ply, pts, velocity_result, ascii=args.ply_ascii)
+        LOGGER.info("velocity: wrote %s and updated %s", out_velocity, out_ply)
     if not args.keep_workspace:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
@@ -2140,10 +2233,12 @@ def finalize_frame(
 
     # In the integrated WAFT mode, velocity is computed AFTER flows are generated (Phase 3,
     # undistorted space). We still write a plain points/<N>.ply now (so progress is visible and
-    # an interrupted run keeps its points) plus a cache of observing cameras; Phase 3 overwrites
-    # the PLY with velocity. Legacy mode (external flow, no --compute_flow) computes it inline.
+    # an interrupted run keeps its points) plus a cache of observing cameras; Phase 3 writes a
+    # separate velocities/<N>.npz and updates the PLY only for frames with configured flow.
+    # Legacy mode (external flow, no --compute_flow) computes it inline.
     defer_velocity = args.compute_flow and args.compute_velocity
     velocity_result = None
+    velocity_has_flow_files = False
     if defer_velocity:
         write_point_cache(args.output_root / "_flowcache" / f"{paths.output_name}.npz", points, images)
     elif args.compute_velocity:
@@ -2152,7 +2247,15 @@ def finalize_frame(
             flow_dir = args.flows_root / paths.output_name
         if not flow_dir.exists():
             flow_dir = args.flows_root
+        velocity_has_flow_files = flow_dir.exists() and any(flow_dir.glob("*.npy"))
         velocity_result = estimate_flow_velocity_for_points(points, cameras, images, flow_dir, args)
+        if velocity_has_flow_files:
+            xyz = np.array([p.xyz for p in points], dtype=np.float32).reshape(len(points), 3)
+            rgb = np.array([p.rgb for p in points], dtype=np.uint8).reshape(len(points), 3)
+            write_velocity_npz(
+                args.output_root / "velocities" / f"{paths.output_name}.npz",
+                xyz, rgb, velocity_result, paths.output_name, None, 1, args.velocity_dt,
+            )
     write_points_ply(paths.output_ply, points, velocity_result, ascii=args.ply_ascii)
 
     if args.undistort:
@@ -2548,9 +2651,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # --- Integrated WAFT optical-flow stage (one command: images -> flows/points/undistorted) ---
     parser.add_argument("--compute_flow", action=argparse.BooleanOptionalAction, default=True,
-                        help="Run WAFT on the undistorted output images (forward N->N+1 per camera) and "
-                             "write output_root/flows/<N>/<cam>.npy aligned 1:1 with undistorted/images. "
+                        help="Run WAFT on the undistorted output images for configured frame anchors and "
+                             "write output_root/flows/<source>/<cam>.npy aligned 1:1 with undistorted/images. "
                              "When on, velocity is computed in undistorted space from these flows.")
+    parser.add_argument("--flow_frame_interval", type=int, default=1,
+                        help="Frame-anchor interval for --compute_flow. 1 keeps adjacent pairs. "
+                             "5 records flows for the 1st, 5th, 10th, ... selected frames and divides "
+                             "the estimated velocity by 5.")
     parser.add_argument("--waft_root", type=Path, default=Path("f:/project/WAFT"),
                         help="Path to the WAFT repo (imported in-process).")
     parser.add_argument("--waft_cfg", type=Path, default=Path("config/a2/twins/chairs-things.json"),
@@ -2630,6 +2737,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.flows_root = args.flows_root.resolve()
     if args.velocity_dt <= 0:
         raise ValueError("--velocity_dt must be positive")
+    if args.flow_frame_interval <= 0:
+        raise ValueError("--flow_frame_interval must be positive")
     if args.pairs_file is not None:
         args.pairs_file = args.pairs_file.resolve()
 
@@ -2764,12 +2873,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.output_root / "undistorted" / "images",
                     args.output_root / "undistorted" / "sparse" / "0")
         if args.compute_flow:
-            LOGGER.info("flow export: %s (aligned 1:1 with undistorted/images)", args.output_root / "flows")
+            LOGGER.info("flow export: %s (frame interval=%d)", args.output_root / "flows", args.flow_frame_interval)
+        if args.compute_flow and args.compute_velocity:
+            LOGGER.info("velocity export: %s", args.output_root / "velocities")
     combined = args.compute_flow and args.compute_velocity
+    velocity_frame_names = {a for a, _ in build_flow_frame_pairs(selected_frames, args.flow_frame_interval)} if combined else set()
     for stats in all_stats:
         if combined:
-            LOGGER.info("%s: ply=%s (velocity logged above by the flow/velocity pass)",
-                        stats["output_name"], stats["sparse_ply"])
+            velocity_path = args.output_root / "velocities" / f"{stats['output_name']}.npz"
+            velocity_note = str(velocity_path) if stats["output_name"] in velocity_frame_names else "skipped (no configured flow)"
+            LOGGER.info("%s: ply=%s velocity=%s", stats["output_name"], stats["sparse_ply"], velocity_note)
         else:
             LOGGER.info(
                 "%s: ply=%s velocity=%d/%d",

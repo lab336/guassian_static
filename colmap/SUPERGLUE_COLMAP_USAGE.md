@@ -93,20 +93,24 @@ output/twopeople1/
       0/                 # 所有帧共享的一组相机（PINHOLE，主点已居中）+ 外参 + points3D
         cameras.bin images.bin points3D.bin
   points/
-    1.ply 2.ply ...      # 每帧稀疏点云（带速度属性）
+    1.ply 2.ply ...      # 每帧稀疏点云；有光流的帧会带速度属性
+  velocities/
+    1.npz 5.npz ...      # 与 points/<帧>.ply 同名的独立速度文件（只写有光流的帧）
   flows/
-    1/                   # 帧 1→2 的前向光流（逐相机）
+    1/                   # 帧 1→2 的前向光流（逐相机）；若 --flow_frame_interval 5 则是 1→5
       1.npy 2.npy ...    # 与 undistorted/images/1/1.png 等逐像素对齐
-    2/                   # 帧 2→3 ...
+      _pair.json         # 记录 source_frame / target_frame / flow_frame_interval，防止续跑误复用旧光流
+    2/                   # 默认相邻帧时是 2→3；间隔采样时只会有锚点帧目录
 ```
 
 关键点：
 - **`undistorted/sparse/0/` 是所有帧共用的一组内外参**（静态机位），相机模型是 PINHOLE 且**主点已居中**（cx=W/2、cy=H/2），所以原版 3DGS 不会再因为忽略 cx/cy 而发糊。
 - **`undistorted/images/<帧>/`** 是对应的去畸变+居中裁剪图像。同一台相机在所有帧里尺寸一致；不同相机尺寸可以不同（都已在 `cameras.bin` 里各自记好）。
-- **`flows/<N>/<相机>.npy`** 是 WAFT 在去畸变图上算的前向光流 `N→N+1`，`(H,W,2)` 原始像素位移，**与 `undistorted/images/<N>/<相机>.png` 逐像素对齐**，直接用作 4DGS 监督。最后一帧无前向流。
-- **`points/<帧>.ply`** 是每帧点云（带 `vx vy vz` 速度属性，**仅供你自己的 4D 流程用**；不要拿它当 3DGS 的 input.ply，3DGS 用 `sparse/0/points3D.bin` 初始化）。
+- **`flows/<N>/<相机>.npy`** 是 WAFT 在去畸变图上算的前向光流，`(H,W,2)` 原始像素位移，**与 `undistorted/images/<N>/<相机>.png` 逐像素对齐**，直接用作 4DGS 监督。默认是相邻帧 `N→N+1`；如果设置 `--flow_frame_interval 5`，则只记录第 1、5、10... 个选中帧之间的光流，例如 `1→5`、`5→10`。
+- **`points/<帧>.ply`** 是每帧点云。只有有光流的源帧会被 velocity pass 更新出 `vx vy vz` 速度属性；非光流锚点帧保持普通点云/零速度。它**仅供你自己的 4D 流程用**；不要拿它当 3DGS 的 input.ply，3DGS 用 `sparse/0/points3D.bin` 初始化。
+- **`velocities/<帧>.npz`** 是独立速度文件，文件名与 `points/<帧>.ply` 对应，点顺序也与该 PLY 的 vertex 顺序一一对齐。里面包含 `velocity`、`valid`、`confidence`、`view_counts`、`xyz`、`rgb`、`source_frame`、`target_frame`、`frame_interval`、`velocity_dt`。该文件只会为有光流的源帧写出。
 
-输出帧名与输入帧文件夹名一致：输入 `images/1` → `images/1/`、`points/1.ply`。
+输出帧名与输入帧文件夹名一致：输入 `images/1` → `images/1/`、`points/1.ply`、`velocities/1.npz`（如果第 1 帧有光流）。
 
 喂 3DGS 时，把某一帧组成标准布局即可：`images/` 用 `undistorted/images/<帧>/`，`sparse/0/` 用 `undistorted/sparse/0/`。
 
@@ -117,7 +121,7 @@ output/twopeople1/
 ```text
 x y z                  # 坐标
 red green blue         # 颜色
-vx vy vz               # 速度（COLMAP 世界单位 / velocity_dt）
+vx vy vz               # 速度（COLMAP 世界单位 / (velocity_dt * flow_frame_interval)）
 velocity_confidence    # 速度置信度 0~1
 velocity_valid         # 该点速度是否有效 0/1
 velocity_views         # 参与速度三角化的相机数
@@ -127,7 +131,7 @@ velocity_views         # 参与速度三角化的相机数
 
 ### 一条命令跑通 SuperGlue + COLMAP + WAFT（默认开启）
 
-现在**只输入图片**即可，脚本会自动把三件事串起来，输出 `undistorted/`、`points/`、`flows/`：
+现在**只输入图片**即可，脚本会自动把三件事串起来，输出 `undistorted/`、`points/`、`flows/`，以及有速度的 `velocities/`：
 
 ```powershell
 conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1:201 --static_rig --force `
@@ -138,8 +142,8 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 
 流程分三阶段（都在一个进程里）：
 1. **重建 + 去畸变**：SuperGlue+COLMAP 解算每帧位姿/内参/稀疏点 → 去畸变+主点居中 → `undistorted/images/<帧>/<相机>.png` + 共享 `undistorted/sparse/0`。
-2. **WAFT 光流**：重建完成后释放 SuperGlue 显存、加载 WAFT，对**去畸变图**逐相机做相邻帧前向光流 `N→N+1`，写 `flows/<N>/<相机>.npy`。**flow 与 `undistorted/images/<N>/<相机>.png` 逐像素对齐**（原生分辨率），可直接做 4DGS 监督。
-3. **速度**：在**去畸变 PINHOLE 空间**用刚生成的 flow 给每个 3D 点算 `vx/vy/vz`，写进 `points/<N>.ply`。最后一帧无前向流 → 速度为 0。
+2. **WAFT 光流**：重建完成后释放 SuperGlue 显存、加载 WAFT，对**去畸变图**逐相机做前向光流。默认相邻帧 `N→N+1`；设置 `--flow_frame_interval 5` 时只做第 1、5、10... 个选中帧的光流，例如 `1→5`、`5→10`。结果写 `flows/<源帧>/<相机>.npy`。**flow 与 `undistorted/images/<源帧>/<相机>.png` 逐像素对齐**（原生分辨率），可直接做 4DGS 监督。
+3. **速度**：在**去畸变 PINHOLE 空间**用刚生成的 flow 给有光流的源帧 3D 点算 `vx/vy/vz`，写进 `points/<源帧>.ply`，并额外写 `velocities/<源帧>.npz`。没有光流的帧不估计初始速度。
 
 > **关于 WAFT 分辨率**：WAFT **不是只能输出 1600×900**——它输出分辨率 = 输入分辨率（内部按 32 的倍数 padding 再裁回）。之前的 1600×900 只是因为喂了 1600×900 的图。这里默认在**去畸变原生分辨率**上跑（与图 1:1）。若显存不够，用 `--flow_max_size 2560` 限制长边（flow 存为该尺寸，按比例对齐）。
 
@@ -148,16 +152,17 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `--compute_flow` | 开 | 跑集成的 WAFT 阶段并输出 `flows/`。关掉用 `--no-compute_flow`（退回旧的「外部光流」模式，用 `--flows_root`）。 |
+| `--flow_frame_interval` | 1 | 光流锚点间隔。`1` = 保持旧行为，相邻帧 `N→N+1`；`5` = 只记录第 1、5、10... 个选中帧的光流，例如 `1→5`、`5→10`，速度会在结果基础上除以 5。 |
 | `--waft_root` | `f:/project/WAFT` | WAFT 仓库路径（进程内导入，需在 `gsstatic` 环境）。 |
 | `--waft_ckpt` | `ckpts/a2/waftv2-ckpts/twins/zero-shot.pth` | WAFT 权重（相对 `--waft_root`）。`--waft_cfg` 同理。 |
 | `--flow_max_size` | 0（原生） | 限制喂给 WAFT 的长边以省显存；0 = 去畸变原生分辨率。 |
 | `--flow_direction` | forward | 速度按前向 `N→N+1` 解释。若另有反向流可用 `backward` 取反。 |
-| `--velocity_dt` | 1.0 | 帧间隔。若改用更大时间基线（`N→N+k`）让运动更明显，把它设为 `k`。 |
-| `--skip_existing_flow` | 关 | 断点续跑时跳过已存在的 `.npy`。 |
+| `--velocity_dt` | 1.0 | 单帧时间间隔。最终速度分母是 `velocity_dt * flow_frame_interval`。通常保持 1.0，用 `--flow_frame_interval` 控制光流时间基线即可。 |
+| `--skip_existing_flow` | 关 | 断点续跑时跳过已存在的 `.npy`。脚本会检查 `flows/<源帧>/_pair.json`，只有源帧、目标帧、间隔都一致才复用，避免换间隔后误用旧光流。 |
 
 > 跑完看日志自检：`flow: a->b wrote N/M cameras`、`velocity(undist): N/M points passed`、`velocity(undist): median applied flow displacement = X px`（应是亚像素~几像素，不该是上千）。位移 >10% 图宽会告警。
 >
-> **提升速度信号**：若逐帧运动是亚像素（信号弱），用更大时间基线 `N→N+k` 配 `--velocity_dt k`；或保持原生分辨率（默认）以保留细节。
+> **提升速度信号**：若逐帧运动是亚像素（信号弱），用更大时间基线，例如 `--flow_frame_interval 5` 会计算第 1→5、5→10... 帧的光流，并自动把速度除以 5；或保持原生分辨率（默认）以保留细节。
 
 ---
 
@@ -302,9 +307,9 @@ conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1 --keep_worksp
 不是单相机直接投影，而是多视角光流三角化：
 
 1. 读取 COLMAP 中每个 3D 点被哪些相机真实看到；
-2. 在这些相机的光流图里采样它到下一帧的像素位移；
-3. 用多个相机的“下一帧像素”射线重新三角化出下一时刻的 3D 点；
+2. 在这些相机的光流图里采样它从源帧到目标帧的像素位移；
+3. 用多个相机的“目标帧像素”射线重新三角化出目标时刻的 3D 点；
 4. 用重投影误差逐步剔除错误光流和遮挡视角；
-5. 速度 = （下一时刻位置 − 当前位置）/ `velocity_dt`，写入 `vx/vy/vz`。
+5. 速度 = （目标帧位置 − 源帧位置）/ (`velocity_dt * flow_frame_interval`)，写入 `vx/vy/vz`。例如 `--flow_frame_interval 5` 时，先用 `1→5` 的位移估计速度，再除以 5，得到平均到单帧尺度的初始速度。
 
 这样比单视角投影更稳，可以减少镂空点或错误表面投影造成的伪速度。
